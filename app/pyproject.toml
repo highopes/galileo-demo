@@ -1,0 +1,30 @@
+[project]
+name = "splunk-ao-langgraph-fsi-agent"
+version = "0.1.0"
+description = "A demo langgraph Financial Services agent with Splunk AO evaluations"
+license = "MIT"
+requires-python = "<3.14,>=3.11"
+dependencies = [
+  "aiohttp>=3.14.1,<4",
+  "chainlit~=2.5.5",
+  "splunk-ao[langchain]",
+  "grandalf>=0.8",
+  "langchain[openai]~=0.3.18",
+  "langgraph~=0.4.7",
+  # LangGraph 0.4.x does not expose the private modules used by prebuilt 1.x.
+  "langgraph-prebuilt>=0.2.2,<0.3",
+  # 0.0.28+ assumes newer generic Pregel APIs than LangGraph 0.4.x provides.
+  "langgraph-supervisor==0.0.26",
+  "pinecone[asyncio]>=6.0.2,<8",
+  "python-dotenv>=1.2.2",
+]
+
+[dependency-groups]
+dev = [
+  "ruff>=0.11.11",
+  "pytest (>=8.4.1,<9.0.0)",
+  "pytest-dotenv>=0.5.2"
+]
+
+[tool.ruff]
+line-length = 120

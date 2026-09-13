@@ -1,0 +1,74 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: splunk-ao-banking-qwen
+  namespace: ${ACK_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: splunk-ao-banking-qwen
+    app.kubernetes.io/part-of: splunk-ao-banking-qwen-demo
+spec:
+  replicas: 1
+  strategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: splunk-ao-banking-qwen
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: splunk-ao-banking-qwen
+        app.kubernetes.io/part-of: splunk-ao-banking-qwen-demo
+    spec:
+      automountServiceAccountToken: false
+      imagePullSecrets:
+        - name: registry-pull
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: banking-chatbot
+          image: ${IMAGE_REF}
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: splunk-ao-banking-qwen-config
+            - secretRef:
+                name: splunk-ao-banking-qwen-runtime
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          startupProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 2
+            failureThreshold: 3
+          terminationMessagePolicy: FallbackToLogsOnError
+      terminationGracePeriodSeconds: 30

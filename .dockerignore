@@ -1,0 +1,17 @@
+.git/
+.gitignore
+.agent-context/
+.deploy.env
+.env
+.env.*
+!.env.example
+.secrets/
+.runtime/
+upstream/
+app/.venv/
+app/tests/
+**/__pycache__/
+**/*.pyc
+*kubeconfig*
+*.log
+.DS_Store
