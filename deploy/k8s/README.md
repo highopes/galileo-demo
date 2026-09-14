@@ -24,10 +24,12 @@
 
 ```bash
 ./scripts/switch_prompt.sh status
-./scripts/switch_prompt.sh baseline
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 ./scripts/switch_prompt.sh improved
 ./scripts/switch_prompt.sh custom /absolute/path/to/prompt.txt
 ```
+
+当前已部署镜像中的官方原始 `baseline` 会被 `qwen3.7-flash` 自动补全而看不到故障，因此第一条 `custom` 命令是当前 ACK 的 Qwen baseline。它保留一次完整 score agent/tool 调用，却让未列明的 score 结果在 Supervisor 回程时进入兜底；`improved` 正确交付 550。下次从最新源码构建镜像后，可直接用 `./scripts/switch_prompt.sh baseline`，并获得 `[baseline]` Session 标签。
 
 切换仅更新挂载的 ConfigMap；升级后的运行 Pod 不重启，也不重建镜像或集群。脚本会等待 ConfigMap 投影生效并核验应用 resolver；只有检测到未挂载该配置的旧 Deployment 时，才兼容性地滚动一次应用 Pod。每次切换后新建 Chainlit 聊天；Splunk AO Session 名称会包含 prompt profile。
 

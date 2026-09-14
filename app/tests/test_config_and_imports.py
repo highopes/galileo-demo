@@ -67,8 +67,10 @@ class SupervisorPromptProfileTests(unittest.TestCase):
         self.assertEqual(profile, "baseline")
         self.assertIn("credit card information agent", prompt)
         self.assertNotIn("credit score agent", prompt)
+        self.assertIn("Because credit-score handling is not documented", prompt)
+        self.assertIn("make exactly one handoff", prompt)
 
-    def test_improved_adds_only_the_official_credit_score_capability(self) -> None:
+    def test_improved_documents_the_credit_score_capability(self) -> None:
         with patch.dict(os.environ, {"SUPERVISOR_PROMPT_PROFILE": "improved"}, clear=True):
             profile, prompt = resolve_supervisor_prompt()
         self.assertEqual(profile, "improved")

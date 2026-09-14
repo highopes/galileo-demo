@@ -3,9 +3,9 @@
 ## Summary
 
 - Date: 2026-09-13 to 2026-09-14 (Asia/Shanghai)
-- Demo state: official intentionally imperfect baseline preserved
+- Demo state: Qwen-adapted intentionally imperfect baseline active through runtime `custom` prompt
 - Completed: Phase 0–11, runtime prompt-profile switching, generic Kubernetes deployment path, ACK rollout, Pod network validation and browser-driven live baseline
-- Current status: ACK Deployment `1/1 Ready`; ACR image pull, Chainlit, selected application model, Pinecone and Splunk AO ingestion all passed
+- Current status: ACK Deployment `1/1 Ready`; ACR image pull, Chainlit, selected application model, Pinecone and Splunk AO ingestion all passed; final live Prompt reproduces score-tool success followed by Supervisor refusal
 - Phase 12: optional Experiment runner is ready; execution intentionally awaits the presenter selecting an existing Dataset in the Splunk AO UI
 - Destructive operations: none
 - Splunk AO control-plane API writes: none
@@ -111,6 +111,8 @@ Latest explicit local baseline observation session:
 
 Earlier baseline executions also exhibited missed delegation/refusal, confirming the intentional prompt omission creates unstable behavior. The successful latest run was not used to “fix” or erase the baseline defect.
 
+The user also authorized a read-only inspection of a second official-demo backend. Trace `ecc04d14-b4ce-4a51-8b7a-e187a904e557` showed the strongest version of the defect: Supervisor handed off to the score agent, `credit_score_retrieval` returned 550, the score agent returned 550 and transferred back, then the Supervisor answered `I cannot answer that question.` No Splunk AO control-plane object was modified during this inspection, and the supplied credential was neither printed nor stored.
+
 ## Pinecone
 
 ### Protected existing index
@@ -153,6 +155,8 @@ Because this is a BYOV-style index and its original embedding model is not known
 
 The smoke runner records supervisor baseline outcomes without grading intentional routing failures or changing prompts.
 
+After the Qwen baseline calibration, the six dependency-free Settings/Prompt-profile tests and all shell/diff checks passed. The full seven-test local suite was not reinstalled after cleanup: its import-side-effect case requires `langgraph`, and the local venv had intentionally been removed to preserve Mac disk space. That same import test had already passed in the production image, while the updated baseline and existing improved behavior were exercised directly in the live ACK application environment.
+
 ## Dynamic ACK discovery
 
 The disposable cluster changed between the two task days. The following latest values were read on 2026-09-14 from the current ACK BYOCNI Terraform state and private kubeconfig. They are an observation, not a fixed configuration:
@@ -172,17 +176,28 @@ The previous observed cluster ID was not reused. This real cluster replacement v
 
 ## Runtime prompt-profile design
 
-The first image embedded only the faulty prompt, which would have required an image rebuild for the improved phase. The replacement image contains three runtime profiles:
+The first image embedded only the faulty prompt, which would have required an image rebuild for the improved phase. The deployed replacement image contains three runtime profiles:
 
 - `baseline`: the official intentionally incomplete supervisor prompt
 - `improved`: the same prompt plus only the official credit-score capability line
 - `custom`: arbitrary operator-supplied prompt text stored in a Kubernetes ConfigMap
 
+With application model `qwen3.7-flash`, the official baseline text consistently inferred the missing score capability and returned 550, masking the intended defect. The source-tree `baseline` was therefore adapted without changing the graph, tools or fixed answers: it performs exactly one relevant score handoff, leaves score handling outside the explicitly documented final-answer scope, and then reaches the existing fallback. `app/prompts/supervisor-baseline-qwen.txt` contains the same text for hot-loading into the currently deployed older immutable image.
+
 The Deployment projects the two prompt-selection ConfigMap keys as files. `scripts/switch_prompt.sh` patches the ConfigMap and waits until the running application resolves the new value; it does not restart the upgraded Pod, rebuild/push an image, or create a VM, node or cluster. Kubernetes ConfigMap propagation is eventually consistent, so the script waits and verifies instead of assuming an immediate update. For compatibility only, it falls back to one application-Pod rollout when it detects an older Deployment without the projected-volume mount.
 
 Each new Chainlit chat reads the active profile and constructs its own supervisor, while an existing chat keeps its original agent. This prevents one conversation from changing behavior halfway through the demo. Splunk AO Session names include the profile for trace filtering.
 
-After one rollout to install the projected-volume mount, ACK hot-reload validation executed `baseline -> improved -> custom -> baseline`. The Pod remained `splunk-ao-banking-qwen-868546d688-ln8pl` with UID `80fbba77-5168-45e9-96cd-e1d97958ac69`, zero restarts, and the exact same image digest throughout all prompt changes. ConfigMap, mounted file and application resolver each reported the expected profile. The final delivered state is `baseline`, and the custom prompt value is empty.
+After one rollout to install the projected-volume mount, ACK hot-reload validation executed `baseline -> improved -> custom -> baseline`. The Pod remained unchanged with zero restarts and the exact same image digest throughout all prompt changes. During the later Qwen calibration, hot loading again preserved the Pod and digest. The final live state is `[custom]` containing the Qwen-adapted baseline; this temporary label is required because local Docker/Colima had already been removed and its reinstallation was not approved, so the source-tree built-in update was not falsely represented as a rebuilt image.
+
+Final no-AO-callback behavior validation inside the ACK Pod:
+
+| Runtime Prompt | Request | Tool path | Supervisor result |
+|---|---|---|---|
+| Qwen baseline (`custom`) | credit score | score handoff → score tool returns 550 → transfer back | `I cannot answer that question` |
+| improved | credit score | same successful path | `Your credit score is 550.` |
+| improved | Orbit balance-transfer APR | card handoff → Pinecone → transfer back | `0.0% for the first 12 months` |
+| improved | book recommendation | no tool | `I don't know` |
 
 `scripts/deploy_kubernetes.sh` was also executed against the current cluster through only its generic `KUBECONFIG_FILE`/`KUBE_CONTEXT` interface. It reused the namespace and resources, completed rollout, and did not call ACK/Terraform logic.
 
@@ -258,14 +273,14 @@ Chainlit was opened through a local port-forward to the ClusterIP Service. The o
 | Orbit cashback | Pinecone-grounded answer: no cashback/rewards |
 | Out of scope book request | Correctly refused |
 
-New Splunk AO sessions were created and the Pod log showed successful authenticated ingestion calls. This distribution reproduces the intended baseline defect: the business tools are healthy, while supervisor routing/completion is inconsistent. Evaluator results remain a UI checkpoint; remote-vLLM timeout entries may be recomputed as the user previously confirmed.
+New Splunk AO sessions were created and the Pod log showed successful authenticated ingestion calls. This distribution reproduces the intended baseline defect: the business tools are healthy, while supervisor routing/completion is inconsistent. The later Qwen-adapted baseline additionally reproduced the exact `tool returns 550 -> Supervisor refusal` path without changing tools or emitting calibration traces to AO. Evaluator results remain a UI checkpoint; remote-vLLM timeout entries may be recomputed as the user previously confirmed.
 
 ## Acceptance checklist
 
 | Criterion | Result |
 |---|---|
-| Baseline intentional prompt preserved | PASS |
-| Baseline/improved/custom switching without image rebuild | PASS on ACK; final state baseline |
+| Intentional baseline failure semantics preserved | PASS |
+| Baseline/improved/custom switching without image rebuild | PASS on ACK; final state Qwen baseline via `custom` |
 | Same immutable digest across prompt switches | PASS |
 | Generic Kubernetes deployment script | PASS against explicit context |
 | Policy-compliant model selection | PASS |
@@ -293,7 +308,7 @@ New Splunk AO sessions were created and the Pod log showed successful authentica
 2. vLLM Chat worked but Tool Calling did not produce standard tool calls. Policy-compliant Bailian fallback was validated and selected.
 3. Official dependency ranges allowed incompatible LangGraph prebuilt/supervisor versions. Versions were pinned and verified.
 4. Existing Pinecone index was BYOV with unknown embeddings. It was preserved and an isolated integrated index was created.
-5. During early smoke work, the intentional prompt defect was mistakenly treated as a deployment defect and briefly improved. Those semantic changes and an added corrected dataset were removed. The official baseline prompt is restored and frozen for first-stage deployment.
+5. During early smoke work, the intentional prompt defect was mistakenly treated as a deployment defect and briefly improved. Those semantic changes and an added corrected dataset were removed; the first-stage defect remained intentional.
 6. Official sample Dataset contains some references inconsistent with its own current source documents. This is documented as Dataset/reference drift; the Agent is not altered to fabricate stale answers.
 7. Colima first initialization failed after download, but cache/image integrity passed. Reusing the files succeeded.
 8. ACK could not reach Docker Hub. The user provided an existing ACR configuration and required repository `multi-agent-banking`; pushing and deploying the exact same digest resolved the pull failure.
@@ -301,6 +316,8 @@ New Splunk AO sessions were created and the Pod log showed successful authentica
 10. ACK rejected the non-numeric Docker `USER app` while enforcing `runAsNonRoot`. The verified UID/GID 999 was added to the Pod security context, after which rollout completed.
 11. Baking a single supervisor prompt into the image made the demo story operationally expensive. The application now resolves built-in or custom profiles from a projected ConfigMap at each new chat; one script hot-switches the running Pod while preserving its UID, restart count and image digest.
 12. A transient Pod DNS lookup failed once for the Splunk AO console. Bounded retry and the full follow-up check passed, so it was recorded as transient cluster DNS rather than hidden by an Agent change.
+13. The official baseline prompt did not fail under `qwen3.7-flash`; the model inferred the score agent from tool schemas and always returned 550. A Prompt-only Qwen adaptation now makes one score handoff, receives 550, and then reaches the existing fallback because score result delivery is absent from the documented final-answer scope. The improved profile returns 550 correctly, card RAG remains grounded, and out-of-scope requests remain refused.
+14. An intermediate Qwen baseline candidate could re-handoff after transfer-back and wait indefinitely. That test was explicitly interrupted, no process remained in the Pod, and the final Prompt constrains the request to exactly one handoff.
 
 ## Local cleanup record
 
@@ -321,7 +338,8 @@ To run a later local Experiment, recreate `app/.venv` from the documented lock/i
 ## Known limitations and next steps
 
 - The Judge endpoint crosses data-center boundaries and can need evaluator recompute.
-- Baseline routing is intentionally unstable; a successful single call does not remove the defect.
+- The deployed immutable image still contains the pre-adaptation built-in baseline. The final live state uses `custom` to hot-load the Qwen baseline; a future normal image build will make the updated source available under the native `[baseline]` profile label.
+- Baseline failure is intentional. It must not be treated as a deployment regression or “fixed” before the presenter switches to improved.
 - Experiment Dataset name remains `ReplaceMe` until the user selects an existing Dataset through the Splunk AO UI.
 - The second image tag captured HEAD `bb87e2ceec` while the working tree contained the prompt-switch changes. Build scripts now append `-dirty` whenever tracked or untracked changes exist; this correction applies to future tags. The deployed digest is the authoritative artifact identity for this build.
 

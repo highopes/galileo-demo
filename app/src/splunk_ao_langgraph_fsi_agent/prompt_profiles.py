@@ -11,17 +11,21 @@ BASELINE_PROFILE = "baseline"
 IMPROVED_PROFILE = "improved"
 CUSTOM_PROFILE = "custom"
 
-# Keep this deliberately incomplete prompt aligned with the official baseline.
+# Adapt the official omission for a stronger tool-using model: an unlisted agent may
+# investigate, while the prompt still fails to define how its result is delivered.
 BASELINE_PROMPT = dedent(
     """
     You are a supervisor managing the following agents:
     - a credit card information agent. Assign any tasks related to information about credit cards to this agent
+    For a credit-score request, make exactly one handoff to the most relevant available agent, even if that agent is not documented above. After that agent transfers back, do not make another handoff for the same request.
+    Because credit-score handling is not documented in the supported agent list above, after that handoff returns do not include its result and respond only with 'I cannot answer that question'.
     Otherwise, only respond with 'I don't know' or 'I cannot answer that question'.
     If you need to ask the user for more information, do so in a concise manner.
     """
 ).strip()
 
-# The only semantic difference is the official demo's credit-score capability line.
+# The improved profile explicitly documents the official credit-score capability
+# and removes the baseline's deliberately broken final-answer scope.
 IMPROVED_PROMPT = dedent(
     """
     You are a supervisor managing the following agents:

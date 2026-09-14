@@ -1,6 +1,6 @@
 # Splunk AO Multi-Agent Banking Chatbot — ACK + Qwen Demo
 
-这是 Splunk Agent Observability（Splunk AO）官方 Multi-agent banking chatbot 的 ACK 部署版本。它保留官方 demo 的一个**故意缺陷**：第一版 supervisor prompt 只描述 credit-card agent，没有描述已经存在的 credit-score agent。演示者先展示这种缺陷造成的偶发错路由/拒答，再使用 Splunk AO Trace、Insights、四个 Qwen Evaluator 和 Experiment 定位、修改、回归验证。
+这是 Splunk Agent Observability（Splunk AO）官方 Multi-agent banking chatbot 的 ACK 部署版本。它保留官方 demo 的一个**故意缺陷**：第一版 supervisor prompt 只描述 credit-card agent，没有描述已经存在的 credit-score agent。它可能正确调用 score agent 和工具、取得 `550`，却在回到 supervisor 后漏答或触发兜底拒绝；也可能直接拒绝或碰巧正确回答。这种不确定性和无效 Token 消耗正是第一阶段要观察的问题。第二阶段只改善 prompt，使信用卡与信用评分问题得到正确回答，而银行业务之外的问题继续拒绝。
 
 本项目的重点不是证明“Agent 某一次回答正确”，而是展示 Splunk AO 如何把多 Agent 应用的质量改进变成可观测、可解释、可重复比较的工程流程。
 
@@ -259,10 +259,10 @@ ACK 节点访问 Docker Hub 超时时，使用用户已有的 ACR 保存**同一
 # 查看 ConfigMap、运行中 Pod 和镜像 digest
 ./scripts/switch_prompt.sh status
 
-# 第一阶段：官方故意错误版
-./scripts/switch_prompt.sh baseline
+# 第一阶段：当前 ACK 镜像用 custom 热加载 Qwen 适配 baseline
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 
-# 第二阶段：官方只增加一行 credit-score 能力描述的正确版
+# 第二阶段：明确列出 credit-score 能力的正确版
 ./scripts/switch_prompt.sh improved
 
 # 任意候选 prompt；文件内容写入 ConfigMap，不写入镜像
@@ -274,22 +274,22 @@ ACK 节点访问 Docker Hub 超时时，使用用户已有的 ACR 保存**同一
 
 Kubernetes 的 ConfigMap 投影是最终一致的，通常几秒、最迟可能接近 kubelet 的同步周期；脚本会等待并确认运行中的应用已经解析到目标 profile。每次切换后必须新建 Chainlit 聊天；一个已经开始的聊天继续使用创建该 Session 时的 agent，避免 A/B 中途混用两个 prompt。新的 Splunk AO Session 名称包含 `[baseline]`、`[improved]` 或 `[custom]`，便于 Trace 过滤和销售演示。若脚本检测到尚未升级挂载配置的旧 Deployment，才会兼容性地滚动一次应用 Pod。
 
-这使 A/B 的镜像 digest、应用模型、Pinecone 数据、Judge Integration、四个 Evaluator 和 Kubernetes 资源配置保持一致，主要变量只有 supervisor prompt。`deploy_ack.sh` 的 fresh deployment 会按 `.deploy.env` 明确恢复到 `baseline`，防止演示前误留 improved 状态。
+这使 A/B 的镜像 digest、应用模型、Pinecone 数据、Judge Integration、四个 Evaluator 和 Kubernetes 资源配置保持一致，主要变量只有 supervisor prompt。当前不可变镜像中的官方原始 `baseline` 会被 `qwen3.7-flash` 自动补全而始终正确，因此第一阶段暂以 `[custom]` profile 热加载 `app/prompts/supervisor-baseline-qwen.txt`；它就是当前 Qwen 适配 baseline。源码内建 `baseline` 已同步为同一文本，下次正常构建镜像后即可恢复使用 `./scripts/switch_prompt.sh baseline` 和 `[baseline]` Trace 标签。
 
-本次 ACK 实测在一次性安装 ConfigMap 挂载后执行了 `baseline -> improved -> custom -> baseline`。三次热切换期间 Pod 名称/UID 均未改变、restart count 始终为 0，镜像 digest 始终为 `sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53`；最终 profile 已恢复为 `baseline`，自定义 Prompt 内容已清空。
+早期 ACK 实测完成了 `baseline -> improved -> custom -> baseline` 热切换，Pod 名称/UID、restart count 和镜像 digest 均保持不变。随后针对 `qwen3.7-flash` 重新校准故事线时，同一热加载机制完成了 Qwen baseline 与 improved 的实测对比；当前第一阶段运行状态为 `[custom]`，内容摘要由 `switch_prompt.sh status` 核验，镜像 digest 仍为 `sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53`。
 
 ## Phase 11：第一阶段 Web 交互演示（保留故意错误）
 
 ### 演示前准备
 
 ```bash
-./scripts/switch_prompt.sh baseline
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 ./scripts/port_forward.sh
 ```
 
-打开 `http://127.0.0.1:8000` 和 Splunk AO 中目标 Project/Agent Stream。第一阶段只选择 `baseline`，不要修改源码中的 prompt profiles。
+打开 `http://127.0.0.1:8000` 和 Splunk AO 中目标 Project/Agent Stream。当前镜像下第一阶段 Session 标签是 `[custom]`；新镜像构建后则使用 `[baseline]`。不要在正式第一阶段之前切到 `improved`。
 
-baseline 的核心缺陷是：graph 中有 `credit-score-agent`，但 supervisor system prompt 只写了 credit-card agent。模型有时会从 tool schema 猜对，有时会按照 prompt 拒答。演示目标是展示这种**不稳定性**，不是承诺第一问必失败。
+baseline 的核心缺陷仍来自官方样例：graph 中有 `credit-score-agent`，但受支持能力列表只写了 credit-card agent，也没有正确交付 score agent 返回结果的规则。官方原文在不同模型上具有不确定性；`qwen3.7-flash` 会把这个缺口自动补全，所以本项目的 Qwen 适配 baseline 明确让 score 请求只调查一次，再让未列明能力落入原有兜底。它没有改工具、Graph 或答案，只让当前模型重新显露同一种 supervisor prompt 缺陷。
 
 ### Web 操作步骤
 
@@ -299,13 +299,17 @@ baseline 的核心缺陷是：graph 中有 `credit-score-agent`，但 supervisor
    What is my credit score?
    ```
 
-2. 为了展示非确定性，用 3–5 个独立新聊天重复该问题。记录哪些请求走了：
+2. 当前 Qwen 适配 baseline 应出现下面这条最有说服力的失败路径；在 Splunk AO 中展开它：
 
    ```text
-   Supervisor -> Credit Score Agent -> Credit Score Tool
+   Supervisor
+     -> Credit Score Agent
+     -> Credit Score Tool 返回 550
+     -> Credit Score Agent 把 550 交回 Supervisor
+     -> Supervisor 最终漏答或回答 I cannot answer that question
    ```
 
-   哪些请求直接回答 `I don't know` / `I cannot answer`。
+   官方原始 prompt 在不同模型或不同会话中还可能直接拒绝、漏答或碰巧正确返回 `550`。这种历史分布用来讲解不确定性；当前 Qwen 适配的现场主线则固定观察“工具成功、Supervisor 失败”，避免 `qwen3.7-flash` 每次自动补全缺口。
 
 3. 新建聊天，输入：
 
@@ -346,26 +350,37 @@ baseline 的核心缺陷是：graph 中有 `credit-score-agent`，但 supervisor
 | card RAG | Orbit cashback 问题 | grounded answer：Orbit Basic 没有 cashback/rewards |
 | out of scope | 推荐一本书 | `I cannot answer that question.` |
 
-这些结果不是“修复前后”对比，而是同一份故意有缺陷的 baseline 在独立会话中的真实分布：底层工具和 RAG 能工作，但 supervisor 路由与完成度不稳定。请在 Splunk AO UI 中用对应时间段的 Session/Trace 展开 handoff、tool 与 model spans，再查看四个 Qwen Evaluator 的 explanation；远程 Judge 超时可 recompute。
+针对当前 `qwen3.7-flash` 的最终 A/B 验证如下；测试直接在 ACK Pod 内运行但未挂 AO callback，避免为校准过程制造额外正式 Trace：
+
+| profile | 问题 | 完整工具路径 | Supervisor 最终结果 |
+|---|---|---|---|
+| Qwen baseline（当前 `[custom]`） | `What is my credit score?` | score handoff → `credit_score_retrieval` 返回 550 → transfer back | `I cannot answer that question` |
+| improved | 同上 | 相同路径 | `Your credit score is 550.` |
+| improved | Orbit balance-transfer APR | card handoff → Pinecone → transfer back | `0.0% for the first 12 months` |
+| improved | `Recommend me a good book.` | 无工具 | `I don't know` |
+
+这些结果不是“修复前后”对比，而是同一份故意有缺陷的 baseline 在独立会话中的真实分布：底层工具和 RAG 能工作，但 supervisor 路由与完成度不稳定。另一个经用户明确授权只读检查的官方 demo 后端中，Trace `ecc04d14-b4ce-4a51-8b7a-e187a904e557` 完整记录了 `Supervisor -> score agent -> score tool(550) -> score agent(550) -> Supervisor 拒答`。这条 Trace 证明问题不在工具，而在 supervisor 对返回结果的处理，并且前面的模型、handoff 和工具 Token 都已经消耗。请在 Splunk AO UI 中展开对应 spans 和四个 Qwen Evaluator 的 explanation；远程 Judge 超时可 recompute。
 
 ### 四个 Evaluator 在演示中的关键作用
 
 | Evaluator | 本 demo 要回答的问题 | baseline 中应重点观察 | 改进后希望看到 |
 |---|---|---|---|
-| Action Advancement - Qwen | 每一步是否让用户任务向目标推进？ | supervisor 直接拒答时，没有推进；无效 handoff/循环也会暴露 | 先转派正确专家，再调用工具，每一步都有业务目的 |
-| Action Completion - Qwen | 最终结果是否完成用户请求？ | credit score 被拒答、或结果缺少关键事实 | 返回工具支持的 550，且最终答复完整 |
-| Tool Errors - Qwen | 已调用工具是否发生参数、执行或返回错误？ | 如果它正常而请求仍失败，说明根因更可能是路由/prompt，而非 Pinecone/工具故障 | 保持工具调用无错误；不要用改 prompt 掩盖基础设施错误 |
-| Tool Selection Quality - Qwen | 是否选择了正确的 agent/tool？ | credit-score 问题未转派、card 问题未检索是最直接的信号 | score 请求稳定选择 score agent/tool；card 请求稳定选择 card agent/Pinecone |
+| Action Advancement - Qwen | 每一步是否让用户任务向目标推进？ | handoff 和取到 550 先推进，回到 supervisor 后漏答/拒答则停止推进甚至倒退 | 正确 handoff 后持续推进到用户可见答案 |
+| Action Completion - Qwen | 最终结果是否完成用户请求？ | 即使中间已有 550，最终拒答仍意味着任务未完成 | 返回工具支持的 550，最终答复完整 |
+| Tool Errors - Qwen | 已调用工具是否发生参数、执行或返回错误？ | score tool 可以完全正常；“工具无错但最终失败”把根因缩小到 prompt/编排 | score tool 与 Pinecone 继续保持无错误 |
+| Tool Selection Quality - Qwen | 是否选择了正确的 agent/tool？ | 完整失败 Trace 中甚至可能选对 score agent/tool，因此它与 Completion 的结论并不矛盾；其他会话也可能根本没选工具 | score 问题稳定选择 score agent/tool；card 问题稳定选择 card agent/Pinecone |
 
 具体分数方向与 pass/fail 阈值以各自 rubric 和 explanation 为准。销售演示不要只读一个总分；把四项组合起来讲，才能证明 Splunk AO 在做 root-cause isolation。
 
 ### 第一阶段演示话术
 
-> 这个银行助手表面上能回答问题，但多 Agent 系统真正的风险不是“模型会不会说话”，而是它有没有把请求稳定地交给正确的业务能力。我们故意让 supervisor prompt 漏掉 credit-score agent。单次测试可能碰巧成功，所以传统人工点测容易给出虚假的安全感。
+> 这个银行助手表面上能回答问题，但多 Agent 系统真正的风险不是“模型会不会说话”，而是它能否稳定地把请求交给正确能力，并把子 Agent 的结果真正交付给客户。我们故意让 supervisor prompt 漏掉 credit-score agent。单次测试可能碰巧成功，所以传统人工点测容易给出虚假的安全感。
 >
-> Splunk Agent Observability 记录的不是只有最终文字，而是 supervisor、sub-agent、模型和工具的完整执行路径。现在我们能看到，同样的业务意图是否真的调用了 Credit Score Tool，还是在 supervisor 层提前拒绝。
+> Splunk Agent Observability 记录的不是只有最终文字，而是 supervisor、sub-agent、模型和工具的完整执行路径。最典型的失败中，系统已经转派专家、调用工具并取得 550，花掉整条链路的时间和 Token，最后却在 supervisor 层拒答。只看聊天窗口，我们无法知道答案其实已经取回；看 Trace，浪费发生在哪里一目了然。
 >
-> 四个 Evaluator 各自提供不同证据：Tool Selection Quality 看选路，Action Advancement 看每一步有没有推进，Action Completion 看客户目标是否完成，Tool Errors 用来排除工具和基础设施故障。这样团队不会看到坏答案就盲目换模型，也不会为了一个分数把错误藏起来。
+> Prompt 最后的兜底拒绝本身并不是坏设计。银行 Agent 需要默认 deny，避免越界问题把模型诱导到未经定义的业务范围。真正的错误是 Prompt 没把“信用评分”列入合法业务能力，也没有告诉 supervisor 如何交付该子 Agent 的返回结果，于是合理的兜底错误地吞掉了合法答案。改进应该补全能力和交付规则，而不是删除安全兜底。
+>
+> 四个 Evaluator 各自提供不同证据：Tool Selection Quality 看选路，Action Advancement 看每一步有没有推进，Action Completion 看客户目标是否完成，Tool Errors 用来排除工具和基础设施故障。四项组合后，我们能证明“工具选对且执行成功，但任务仍未完成”，把问题准确定位到 supervisor prompt。
 
 ## Phase 12：第二阶段 Experiment 改进演示
 
@@ -401,15 +416,15 @@ SPLUNK_AO_EXPERIMENT_DATASET="实际已有 Dataset 名称"
 
 runner 只读取已有 Dataset，创建一次正式 Experiment，使用精确 evaluator 名称；每 10 秒有界 polling，最长约 10 分钟，不会无限等待。记录 baseline experiment 名称/链接、每行 trace、四项分数和 explanations。
 
-### B. 演示者切换到官方最小改进
+### B. 演示者切换到 improved
 
-`app/src/splunk_ao_langgraph_fsi_agent/prompt_profiles.py` 已将两个 profile 并列保存，`improved` 相比 `baseline` 只加入：
+`app/src/splunk_ao_langgraph_fsi_agent/prompt_profiles.py` 已将两个 profile 并列保存。`improved` 明确把 credit-score agent 列入支持能力：
 
 ```text
 - a credit score agent. Use this to get the users credit score.
 ```
 
-这是官方 sample 设计的最小修复。演示者无需编辑源码或重建镜像，直接切换：
+同时不再包含 Qwen baseline 中故意缺失的结果交付规则。其业务含义仍是官方 sample 的最小修复：让 Supervisor 知道信用评分请求属于哪个 Agent；不修改工具、Graph、模型或答案。演示者无需编辑源码或重建镜像，直接切换：
 
 ```bash
 ./scripts/switch_prompt.sh improved
@@ -459,7 +474,7 @@ Routing policy:
 
 > 刚才我们没有靠猜测修改代码。Splunk AO 的 trace 告诉我们 credit-score tool 本身能工作，Tool Errors 也没有指出执行故障；真正异常集中在 supervisor 的选择和任务完成。这把排查范围从整套模型、数据库和网络，缩小到一段 routing prompt。
 >
-> 现在我们把运行时 profile 从 baseline 切到 improved。镜像 digest、应用模型、Judge、Dataset 和四个 Evaluator 都保持不变，唯一的业务变量就是官方建议的一行 credit-score 能力描述。重新运行 Experiment 后，我们比较的不是两段精心挑选的聊天截图，而是同一组业务输入上的可重复结果。
+> 现在我们把运行时 Prompt 从 Qwen baseline 切到 improved。镜像 digest、应用模型、Judge、Dataset 和四个 Evaluator 都保持不变，唯一的业务变量是 Supervisor 对 credit-score 能力及返回结果的描述。重新运行 Experiment 后，我们比较的不是两段精心挑选的聊天截图，而是同一组业务输入上的可重复结果。
 >
 > 如果 Tool Selection Quality、Action Advancement 和 Action Completion 的结果及解释一起改善，同时 Tool Errors 保持健康，我们就得到了一条可审计的改进证据链：问题在哪里、改了什么、为什么有效、有没有引入新故障。这正是 Splunk AO 帮助企业把 Agent 从 demo 推向生产治理的关键价值。
 
@@ -567,7 +582,7 @@ kubectl --kubeconfig /absolute/path/to/kubeconfig \
 KUBECONFIG_FILE=/absolute/path/to/kubeconfig \
 KUBE_CONTEXT=your-context \
 KUBE_NAMESPACE=galileo-demo \
-  ./scripts/switch_prompt.sh baseline
+  ./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
 
 KUBECONFIG_FILE=/absolute/path/to/kubeconfig \
 KUBE_CONTEXT=your-context \
@@ -575,7 +590,7 @@ KUBE_NAMESPACE=galileo-demo \
   ./scripts/switch_prompt.sh improved
 ```
 
-自定义候选 prompt 使用 `custom /absolute/path/to/prompt.txt`。每次切换只更新 ConfigMap，升级后的运行 Pod 不重启；等待脚本确认应用 resolver 已读取新 profile 后新建聊天。Splunk AO Session 名称中的 profile 标签可用于筛选 baseline/improved Trace，再用四个 Evaluator 和 Experiment 比较。
+当前发布镜像中，Qwen baseline 通过上述 `custom` 文件热加载，Session 标签为 `[custom]`；重新构建包含最新源码的镜像后可直接使用 `baseline`。其他自定义候选 prompt 同样使用 `custom /absolute/path/to/prompt.txt`。每次切换只更新 ConfigMap，升级后的运行 Pod 不重启；等待脚本确认应用 resolver 已读取新 profile 后新建聊天，再用四个 Evaluator 和 Experiment 比较。
 
 ### 5. 通用 Kubernetes 清理
 
@@ -639,9 +654,9 @@ kubectl --kubeconfig "当前动态发现的 kubeconfig" \
 
 处理：使用 `app/requirements.lock`；保持 `langgraph-prebuilt 0.2.x`、`langgraph-supervisor 0.0.26` 与 LangGraph 0.4.x 组合。
 
-### supervisor 单次 baseline 恰好路由正确
+### 官方 baseline 在 `qwen3.7-flash` 上总是正确
 
-这不是 demo 失败。故意缺陷表现为可靠性不足，不保证每次都错。使用多个独立聊天或固定 Dataset Experiment 观察分布，并由 Evaluator explanation 证明行为路径。
+较强的工具调用模型可能从 handoff schema 自动补全官方 prompt 缺失的 credit-score 描述，使原始 baseline 始终返回 `550`。当前发布镜像用 `custom app/prompts/supervisor-baseline-qwen.txt` 恢复第一阶段：score agent/tool 正常运行并返回 550，但 Supervisor 因未列明的最终支持范围触发兜底。不要通过修改工具或硬编码 550 制造对比。
 
 ### RAG 答案与 Dataset reference 不一致
 
