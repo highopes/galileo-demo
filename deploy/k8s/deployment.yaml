@@ -41,6 +41,17 @@ spec:
                 name: splunk-ao-banking-qwen-config
             - secretRef:
                 name: splunk-ao-banking-qwen-runtime
+          env:
+            # Projected ConfigMap files update in-place. New Chainlit sessions read
+            # these paths, so prompt A/B switches do not restart the Pod.
+            - name: SUPERVISOR_PROMPT_PROFILE_FILE
+              value: /etc/banking-prompt/SUPERVISOR_PROMPT_PROFILE
+            - name: SUPERVISOR_PROMPT_CUSTOM_FILE
+              value: /etc/banking-prompt/SUPERVISOR_PROMPT_CUSTOM
+          volumeMounts:
+            - name: supervisor-prompt
+              mountPath: /etc/banking-prompt
+              readOnly: true
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -71,4 +82,13 @@ spec:
             timeoutSeconds: 2
             failureThreshold: 3
           terminationMessagePolicy: FallbackToLogsOnError
+      volumes:
+        - name: supervisor-prompt
+          configMap:
+            name: splunk-ao-banking-qwen-config
+            items:
+              - key: SUPERVISOR_PROMPT_PROFILE
+                path: SUPERVISOR_PROMPT_PROFILE
+              - key: SUPERVISOR_PROMPT_CUSTOM
+                path: SUPERVISOR_PROMPT_CUSTOM
       terminationGracePeriodSeconds: 30

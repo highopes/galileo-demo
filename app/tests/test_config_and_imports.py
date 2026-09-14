@@ -5,10 +5,13 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from src.splunk_ao_langgraph_fsi_agent.config import Settings, get_settings
+from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt
 
 
 VALID_ENV = {
@@ -55,6 +58,39 @@ class ImportSideEffectTests(unittest.TestCase):
         with patch("socket.create_connection", side_effect=AssertionError("network attempted during import")):
             for name in module_names:
                 importlib.import_module(name)
+
+
+class SupervisorPromptProfileTests(unittest.TestCase):
+    def test_baseline_remains_deliberately_incomplete(self) -> None:
+        with patch.dict(os.environ, {"SUPERVISOR_PROMPT_PROFILE": "baseline"}, clear=True):
+            profile, prompt = resolve_supervisor_prompt()
+        self.assertEqual(profile, "baseline")
+        self.assertIn("credit card information agent", prompt)
+        self.assertNotIn("credit score agent", prompt)
+
+    def test_improved_adds_only_the_official_credit_score_capability(self) -> None:
+        with patch.dict(os.environ, {"SUPERVISOR_PROMPT_PROFILE": "improved"}, clear=True):
+            profile, prompt = resolve_supervisor_prompt()
+        self.assertEqual(profile, "improved")
+        self.assertIn("credit score agent. Use this to get the users credit score.", prompt)
+
+    def test_custom_prompt_can_be_loaded_from_a_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            prompt_file = Path(directory) / "prompt.txt"
+            prompt_file.write_text("Route test requests to the test agent.", encoding="utf-8")
+            environment = {
+                "SUPERVISOR_PROMPT_PROFILE": "custom",
+                "SUPERVISOR_PROMPT_CUSTOM_FILE": str(prompt_file),
+            }
+            with patch.dict(os.environ, environment, clear=True):
+                profile, prompt = resolve_supervisor_prompt()
+        self.assertEqual(profile, "custom")
+        self.assertEqual(prompt, "Route test requests to the test agent.")
+
+    def test_unknown_prompt_profile_is_rejected(self) -> None:
+        with patch.dict(os.environ, {"SUPERVISOR_PROMPT_PROFILE": "unknown"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "Unsupported SUPERVISOR_PROMPT_PROFILE"):
+                resolve_supervisor_prompt()
 
 
 if __name__ == "__main__":

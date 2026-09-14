@@ -19,6 +19,7 @@ load_dotenv()
 
 from src.splunk_ao_langgraph_fsi_agent.agents.supervisor_agent import create_supervisor_agent  # noqa: E402
 from src.splunk_ao_langgraph_fsi_agent.config import get_settings  # noqa: E402
+from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt  # noqa: E402
 
 
 @cl.on_chat_start
@@ -30,14 +31,17 @@ async def on_chat_start() -> None:
     It initializes the chat with a welcome message.
     """
     get_settings()
-    cl.user_session.set("supervisor_agent", create_supervisor_agent())
-    create_splunk_ao_session()
+    prompt_profile, _ = resolve_supervisor_prompt()
+    supervisor_agent = create_supervisor_agent(prompt_profile)
+    cl.user_session.set("supervisor_agent", supervisor_agent)
+    cl.user_session.set("supervisor_prompt_profile", prompt_profile)
+    create_splunk_ao_session(prompt_profile)
 
     # Send a welcome message to the user
     await cl.Message(content="Welcome to the Brahe Bank assistant! How can I help you today?").send()
 
 
-def create_splunk_ao_session():
+def create_splunk_ao_session(prompt_profile: str):
     """
     Create a new Splunk AO session for tracking user interactions.
 
@@ -46,7 +50,7 @@ def create_splunk_ao_session():
     try:
         # Start Splunk AO session with unique session name
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        session_name = f"FSI Agent - {current_time}"
+        session_name = f"FSI Agent [{prompt_profile}] - {current_time}"
         splunk_ao_context.start_session(name=session_name, external_id=cl.context.session.id)
 
         # Create the callback. This needs to be created in the same thread as the session

@@ -25,6 +25,7 @@ from splunk_ao.handlers.langchain import SplunkAOCallback  # noqa: E402
 
 from src.splunk_ao_langgraph_fsi_agent.agents.supervisor_agent import create_supervisor_agent  # noqa: E402
 from src.splunk_ao_langgraph_fsi_agent.config import get_settings  # noqa: E402
+from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt  # noqa: E402
 
 
 POLL_INTERVAL_SECONDS = 10
@@ -63,7 +64,8 @@ def main() -> int:
         )
         return 2
 
-    supervisor = create_supervisor_agent()
+    prompt_profile, _ = resolve_supervisor_prompt()
+    supervisor = create_supervisor_agent(prompt_profile)
 
     def run_agent(dataset_input: Any) -> str:
         if isinstance(dataset_input, dict):
@@ -83,7 +85,7 @@ def main() -> int:
         )
         return str(response["messages"][-1].content)
 
-    experiment_name = f"banking-qwen-demo-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
+    experiment_name = f"banking-qwen-demo-{prompt_profile}-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}"
     response = run_experiment(
         experiment_name,
         project=project,

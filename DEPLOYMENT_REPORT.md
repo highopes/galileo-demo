@@ -2,9 +2,9 @@
 
 ## Summary
 
-- Date: 2026-09-13 (Asia/Shanghai)
+- Date: 2026-09-13 to 2026-09-14 (Asia/Shanghai)
 - Demo state: official intentionally imperfect baseline preserved
-- Completed: Phase 0–11, including ACK rollout, Pod network validation and browser-driven live baseline
+- Completed: Phase 0–11, runtime prompt-profile switching, generic Kubernetes deployment path, ACK rollout, Pod network validation and browser-driven live baseline
 - Current status: ACK Deployment `1/1 Ready`; ACR image pull, Chainlit, selected application model, Pinecone and Splunk AO ingestion all passed
 - Phase 12: optional Experiment runner is ready; execution intentionally awaits the presenter selecting an existing Dataset in the Splunk AO UI
 - Destructive operations: none
@@ -14,10 +14,10 @@
 
 ## Source provenance
 
-- Galileo repository: initial repository currently has no Git commit; files are untracked and therefore image tag is marked `uncommitted`.
+- Galileo repository HEAD at the second build: `bb87e2ceec3e75cf875417984be3de3131e34ea0`; runtime prompt-switch changes were intentionally still in the working tree.
 - Splunk AO upstream: `splunk/splunk-ao-python` commit `53b9df9c4ae01f940a55a08d446b2212f67ff94c`
-- ACK infrastructure working clone: `highopes/alicloud-ack-byocni` commit `3587981027117f1c2669c9ff763c0bc0367187f3`
-- ACK infrastructure working tree at discovery: clean
+- ACK infrastructure working clone at the latest discovery: commit `c39698832067`
+- ACK infrastructure working tree at the latest discovery contained user-owned changes in `README.md`, `docs/MIGRATION.md` and `kup`; they were only reported and never modified by this task
 
 The upstream clone under `upstream/splunk-ao-python` was not modified. The `after` sample was copied into `app` before adaptation.
 
@@ -53,7 +53,7 @@ Exact versions are stored in `app/requirements.lock`. Key versions:
 | pinecone | 7.3.0 |
 | openai | 2.54.0 |
 
-`pip check` passed locally and inside the linux/amd64 production image. Three offline unit tests passed. The explicit prebuilt/supervisor pins resolve incompatibilities observed with newer packages and LangGraph 0.4.x.
+`pip check` passed locally and inside the linux/amd64 production image. Seven offline unit tests passed, including baseline/improved/custom prompt-profile tests. The explicit prebuilt/supervisor pins resolve incompatibilities observed with newer packages and LangGraph 0.4.x.
 
 ## Model preflight
 
@@ -148,16 +148,16 @@ Because this is a BYOV-style index and its original embedding model is not known
 - Chainlit bind on `127.0.0.1:8000`: PASS
 - Chainlit HTTP response: PASS
 - Splunk AO baseline Trace flush: PASS
-- Offline unit tests: 3/3 PASS
-- Secret files: `.secrets` mode 0700; three env files mode 0600
+- Offline unit tests: 7/7 PASS in the production linux/amd64 image
+- Secret files: `.secrets` mode 0700; env files mode 0600
 
 The smoke runner records supervisor baseline outcomes without grading intentional routing failures or changing prompts.
 
 ## Dynamic ACK discovery
 
-The following values were read on 2026-09-13 from the current ACK BYOCNI Terraform state and private kubeconfig. They are an observation, not a fixed configuration:
+The disposable cluster changed between the two task days. The following latest values were read on 2026-09-14 from the current ACK BYOCNI Terraform state and private kubeconfig. They are an observation, not a fixed configuration:
 
-- Current cluster ID: `c2d5f4d1c59604353a3f0c1a50ec2c25c`
+- Current cluster ID: `c5de7bc3cc3224aa6b7f7a64a79b041e8`
 - Cluster name: `ack-byocni-wlcb`
 - Kubernetes version: `1.36.2-aliyun.1`
 - Zone: `cn-wulanchabu-a`
@@ -168,20 +168,36 @@ The following values were read on 2026-09-13 from the current ACK BYOCNI Terrafo
 
 All kubectl calls used explicit kubeconfig/context. The global kube context was not treated as authority or modified. `./kup` and `./kiall` were not executed.
 
+The previous observed cluster ID was not reused. This real cluster replacement validates the dynamic discovery requirement.
+
+## Runtime prompt-profile design
+
+The first image embedded only the faulty prompt, which would have required an image rebuild for the improved phase. The replacement image contains three runtime profiles:
+
+- `baseline`: the official intentionally incomplete supervisor prompt
+- `improved`: the same prompt plus only the official credit-score capability line
+- `custom`: arbitrary operator-supplied prompt text stored in a Kubernetes ConfigMap
+
+The Deployment projects the two prompt-selection ConfigMap keys as files. `scripts/switch_prompt.sh` patches the ConfigMap and waits until the running application resolves the new value; it does not restart the upgraded Pod, rebuild/push an image, or create a VM, node or cluster. Kubernetes ConfigMap propagation is eventually consistent, so the script waits and verifies instead of assuming an immediate update. For compatibility only, it falls back to one application-Pod rollout when it detects an older Deployment without the projected-volume mount.
+
+Each new Chainlit chat reads the active profile and constructs its own supervisor, while an existing chat keeps its original agent. This prevents one conversation from changing behavior halfway through the demo. Splunk AO Session names include the profile for trace filtering.
+
+After one rollout to install the projected-volume mount, ACK hot-reload validation executed `baseline -> improved -> custom -> baseline`. The Pod remained `splunk-ao-banking-qwen-868546d688-ln8pl` with UID `80fbba77-5168-45e9-96cd-e1d97958ac69`, zero restarts, and the exact same image digest throughout all prompt changes. ConfigMap, mounted file and application resolver each reported the expected profile. The final delivered state is `baseline`, and the custom prompt value is empty.
+
+`scripts/deploy_kubernetes.sh` was also executed against the current cluster through only its generic `KUBECONFIG_FILE`/`KUBE_CONTEXT` interface. It reused the namespace and resources, completed rollout, and did not call ACK/Terraform logic.
+
 ## Container image
 
-- Docker Hub source repository: `highope/splunk-ao-banking-qwen-demo`
 - ACK deployment repository: existing ACR `highope/multi-agent-banking`
-- Tag: `20260913-070526-uncommitted`
+- Tag: `20260914-032205-bb87e2ceec`
 - Platform: `linux/amd64`
-- Digest: `sha256:4dbda5a22f2c25c8842f7b4afd611e586ac881271f35bcf5274c5a4ca6ba3ba3`
-- Immutable reference: `highope/splunk-ao-banking-qwen-demo@sha256:4dbda5a22f2c25c8842f7b4afd611e586ac881271f35bcf5274c5a4ca6ba3ba3`
-- Local compressed image size reported by Docker: 131,695,603 bytes
+- Digest: `sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53`
+- Immutable reference: existing ACR `highope/multi-agent-banking` plus the digest above
+- Image size reported by ACK: 131,694,701 bytes
 - Non-root user: yes
 - `pip check` inside image: PASS
 - Local linux/amd64 container HTTP smoke: PASS
-- Docker Hub push: PASS
-- ACR push: PASS; manifest digest and linux/amd64 image match the Docker Hub build
+- Direct ACR build/push: PASS; Docker Hub was bypassed for the replacement image
 - Registry digest resolution: PASS
 - `latest` tag pushed: no
 - Docker auth cleanup after push: PASS
@@ -211,7 +227,7 @@ Service: ClusterIP, no external IP
 The immutable ACR image was pulled successfully in approximately 24 seconds on its first ACK pull. Its digest is:
 
 ```text
-sha256:4dbda5a22f2c25c8842f7b4afd611e586ac881271f35bcf5274c5a4ca6ba3ba3
+sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53
 ```
 
 The earlier Docker Hub failure occurred before layer download and was not an authentication error. The user supplied an existing ACR configuration and explicitly required repository name `multi-agent-banking`; the same image was copied there without creating ACR infrastructure. No random mirror, node proxy or public ACK Service was created.
@@ -219,6 +235,8 @@ The earlier Docker Hub failure occurred before layer download and was not an aut
 The first ACR upload stalled on the previous network and ended with a broken connection. After the user switched networks, the remaining transfer completed almost immediately. Future large-transfer stalls should trigger a prompt to switch network followed by a pause, not repeated polling.
 
 The initial ACR Pod reached `CreateContainerConfigError` because Kubernetes could not prove that image user name `app` was non-root. Local inspection verified `app` is UID/GID 999; the Pod security context now explicitly sets `runAsUser: 999` and `runAsGroup: 999`. This infrastructure-only change did not alter Agent behavior.
+
+The final baseline Pod first saw a transient Splunk AO console DNS lookup failure. An immediate bounded three-host DNS check passed on its first attempt, and the complete model/Pinecone/Splunk AO validation then passed. No application or endpoint configuration was changed.
 
 ## ACK network and Web acceptance
 
@@ -247,6 +265,9 @@ New Splunk AO sessions were created and the Pod log showed successful authentica
 | Criterion | Result |
 |---|---|
 | Baseline intentional prompt preserved | PASS |
+| Baseline/improved/custom switching without image rebuild | PASS on ACK; final state baseline |
+| Same immutable digest across prompt switches | PASS |
+| Generic Kubernetes deployment script | PASS against explicit context |
 | Policy-compliant model selection | PASS |
 | Selected model Tool Calling works | PASS locally |
 | No OpenAI API dependency | PASS |
@@ -278,6 +299,8 @@ New Splunk AO sessions were created and the Pod log showed successful authentica
 8. ACK could not reach Docker Hub. The user provided an existing ACR configuration and required repository `multi-agent-banking`; pushing and deploying the exact same digest resolved the pull failure.
 9. The first ACR transfer stalled on one network. The user switched networks and the remaining upload completed immediately; the documented operating rule is now to ask for a network switch and pause on future large-transfer stalls.
 10. ACK rejected the non-numeric Docker `USER app` while enforcing `runAsNonRoot`. The verified UID/GID 999 was added to the Pod security context, after which rollout completed.
+11. Baking a single supervisor prompt into the image made the demo story operationally expensive. The application now resolves built-in or custom profiles from a projected ConfigMap at each new chat; one script hot-switches the running Pod while preserving its UID, restart count and image digest.
+12. A transient Pod DNS lookup failed once for the Splunk AO console. Bounded retry and the full follow-up check passed, so it was recorded as transient cluster DNS rather than hidden by an Agent change.
 
 ## Local cleanup record
 
@@ -289,7 +312,9 @@ After the final image inspection, unit tests, secret scan, ACK rollout check and
 - Homebrew Colima/Docker/buildx/Lima/QEMU stack and now-unused QEMU dependencies: approximately 912 MB by package reports
 - one known 4 KiB ACR inspection temporary directory
 
-The measured total is approximately 3.7 GB, excluding any additional sparse-disk benefit. Absence of all named directories and packages was verified. Python 3.12 and Alibaba Cloud CLI were retained because they are small compared with the VM stack and are useful for dynamic ACK discovery and later Experiment setup. No ACK namespace, ACR image, Pinecone index, source, runtime record or Secret was removed.
+The first cleanup measured approximately 3.7 GB, excluding any additional sparse-disk benefit. The runtime-prompt replacement image later required one temporary rebuild cycle; after its tests, push and ACK acceptance checks, the container stack was removed again. That final cycle removed 2.1 GB of Colima runtime data, 321 MB of download cache, and approximately 183 MB of Colima/Docker/buildx/Lima formulae. These numbers describe two separate temporary cycles and must not be added together as if they were simultaneously resident.
+
+Final absence of the named Colima directories and the Colima/Docker/buildx/Lima packages was verified. Python 3.12, `kubectl` and Alibaba Cloud CLI were retained because they are small compared with the VM stack and remain useful for dynamic ACK discovery, prompt switching and later Experiment setup. No ACK namespace, ACR image, Pinecone index, source, runtime record or Secret was removed.
 
 To run a later local Experiment, recreate `app/.venv` from the documented lock/install procedure. Reinstall the container stack only if a new application image must be built.
 
@@ -298,6 +323,6 @@ To run a later local Experiment, recreate `app/.venv` from the documented lock/i
 - The Judge endpoint crosses data-center boundaries and can need evaluator recompute.
 - Baseline routing is intentionally unstable; a successful single call does not remove the defect.
 - Experiment Dataset name remains `ReplaceMe` until the user selects an existing Dataset through the Splunk AO UI.
-- Because the Galileo repo has no initial commit, image provenance uses timestamp + `uncommitted`; future builds should include a real commit SHA after user-managed Git initialization/commit.
+- The second image tag captured HEAD `bb87e2ceec` while the working tree contained the prompt-switch changes. Build scripts now append `-dirty` whenever tracked or untracked changes exist; this correction applies to future tags. The deployed digest is the authoritative artifact identity for this build.
 
 See `README.md` for the complete Web and Experiment sales demonstration, evaluator interpretation, prompt improvement procedure, talk track, troubleshooting and future hardening recommendations.

@@ -6,15 +6,23 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/.deploy.env"
 # shellcheck disable=SC1091
-source "$ROOT_DIR/.secrets/dockerhub.env"
+source "$ROOT_DIR/.secrets/acr.env"
 
 "$ROOT_DIR/scripts/discover_ack.sh"
 # shellcheck disable=SC1091
 source "$ROOT_DIR/.runtime/resolved-ack.env"
 
-[[ -n "${DOCKERHUB_USERNAME:-}" ]] || { echo "DOCKERHUB_USERNAME is required" >&2; exit 2; }
-[[ -n "${DOCKERHUB_PAT:-}" ]] || { echo "DOCKERHUB_PAT is required" >&2; exit 2; }
-[[ -n "${DOCKERHUB_REPOSITORY:-}" ]] || { echo "DOCKERHUB_REPOSITORY is required" >&2; exit 2; }
+for name in ACR_REGISTRY ACR_REPOSITORY ACR_USERNAME ACR_PASSWORD; do
+  [[ -n "${!name:-}" ]] || { echo "$name is required" >&2; exit 2; }
+done
+[[ "${ACR_REPOSITORY##*/}" == "multi-agent-banking" ]] || {
+  echo "ACR repository name must be multi-agent-banking" >&2
+  exit 2
+}
+[[ "$ACR_REPOSITORY" == "$ACR_REGISTRY"/* ]] || {
+  echo "ACR_REPOSITORY must belong to ACR_REGISTRY" >&2
+  exit 2
+}
 
 architectures="$(kubectl --kubeconfig "$ACK_KUBECONFIG" --context "$ACK_CONTEXT" \
   get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.architecture}{"\n"}{end}' | sort -u)"
@@ -35,6 +43,7 @@ fi
 docker info >/dev/null
 docker_endpoint="$(docker context inspect "$(docker context show)" --format '{{.Endpoints.docker.Host}}')"
 [[ -n "$docker_endpoint" ]] || { echo "Could not resolve the active Docker endpoint" >&2; exit 2; }
+
 tag="$(date -u +%Y%m%d-%H%M%S)"
 if git -C "$ROOT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
   tag="${tag}-$(git -C "$ROOT_DIR" rev-parse --short=10 HEAD)"
@@ -44,35 +53,34 @@ if git -C "$ROOT_DIR" rev-parse --verify HEAD >/dev/null 2>&1; then
 else
   tag="${tag}-uncommitted"
 fi
-image_ref="${DOCKERHUB_REPOSITORY}:${tag}"
+image_ref="${ACR_REPOSITORY}:${tag}"
 
-docker_config="$ROOT_DIR/.runtime/docker-auth"
+docker_config="$ROOT_DIR/.runtime/acr-build-auth"
 mkdir -p "$docker_config"
 chmod 0700 "$docker_config"
 export DOCKER_CONFIG="$docker_config"
 export DOCKER_HOST="$docker_endpoint"
 
-cleanup_auth() {
-  docker logout >/dev/null 2>&1 || true
-  rm -f "$docker_config/config.json"
-  rmdir "$docker_config" 2>/dev/null || true
+container_name="galileo-acr-smoke-${tag}"
+image_file=""
+acr_file=""
+cleanup() {
+  docker rm --force "$container_name" >/dev/null 2>&1 || true
+  docker logout "$ACR_REGISTRY" >/dev/null 2>&1 || true
+  [[ -z "$image_file" ]] || rm -f "$image_file"
+  [[ -z "$acr_file" ]] || rm -f "$acr_file"
+  rm -rf "$docker_config"
 }
-trap cleanup_auth EXIT
+trap cleanup EXIT
 
-printf '%s' "$DOCKERHUB_PAT" | docker login \
-  --username "$DOCKERHUB_USERNAME" --password-stdin >/dev/null
+printf '%s' "$ACR_PASSWORD" | docker login "$ACR_REGISTRY" \
+  --username "$ACR_USERNAME" --password-stdin >/dev/null
 
 echo "Building local smoke image: $image_ref (linux/amd64)"
 "${buildx[@]}" build --platform linux/amd64 --load --tag "$image_ref" "$ROOT_DIR"
 
-container_name="galileo-image-smoke-${tag}"
 docker run --detach --rm --platform linux/amd64 --name "$container_name" \
   --publish 127.0.0.1::8000 "$image_ref" >/dev/null
-cleanup_container() {
-  docker rm --force "$container_name" >/dev/null 2>&1 || true
-}
-trap 'cleanup_container; cleanup_auth' EXIT
-
 container_port="$(docker port "$container_name" 8000/tcp | awk -F: 'NR==1 {print $NF}')"
 [[ -n "$container_port" ]] || { echo "Could not determine local container port" >&2; exit 2; }
 for _ in $(seq 1 60); do
@@ -87,24 +95,34 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${container_port}/" >/dev/null
-cleanup_container
+docker rm --force "$container_name" >/dev/null
 
-echo "Pushing image: $image_ref"
+echo "Pushing image directly to the configured ACR multi-agent-banking repository."
 "${buildx[@]}" build --platform linux/amd64 --push --tag "$image_ref" "$ROOT_DIR"
 digest="$("${buildx[@]}" imagetools inspect "$image_ref" | awk '/^Digest:/ {print $2; exit}')"
-[[ "$digest" == sha256:* ]] || { echo "Could not resolve pushed image digest" >&2; exit 2; }
-immutable_ref="${DOCKERHUB_REPOSITORY}@${digest}"
+[[ "$digest" == sha256:* ]] || { echo "Could not resolve ACR image digest" >&2; exit 2; }
+immutable_ref="${ACR_REPOSITORY}@${digest}"
 
-resolved_file="$(mktemp "$ROOT_DIR/.runtime/image.env.XXXXXX")"
+image_file="$(mktemp "$ROOT_DIR/.runtime/image.env.XXXXXX")"
+acr_file="$(mktemp "$ROOT_DIR/.runtime/acr-image.env.XXXXXX")"
 {
   printf 'IMAGE_TAG_REF=%q\n' "$image_ref"
   printf 'IMAGE_DIGEST=%q\n' "$digest"
   printf 'IMAGE_IMMUTABLE_REF=%q\n' "$immutable_ref"
   printf 'IMAGE_PLATFORM=%q\n' "linux/amd64"
-} >"$resolved_file"
-chmod 0600 "$resolved_file"
-mv "$resolved_file" "$ROOT_DIR/.runtime/image.env"
+} >"$image_file"
+{
+  printf 'ACR_IMAGE_TAG_REF=%q\n' "$image_ref"
+  printf 'ACR_IMAGE_DIGEST=%q\n' "$digest"
+  printf 'ACR_IMAGE_IMMUTABLE_REF=%q\n' "$immutable_ref"
+  printf 'ACR_IMAGE_PLATFORM=%q\n' "linux/amd64"
+} >"$acr_file"
+chmod 0600 "$image_file" "$acr_file"
+mv "$image_file" "$ROOT_DIR/.runtime/image.env"
+mv "$acr_file" "$ROOT_DIR/.runtime/acr-image.env"
+image_file=""
+acr_file=""
 
-echo "Image tag: $image_ref"
-echo "Image digest: $digest"
+echo "ACR image push: PASS"
+echo "ACR image digest: $digest"
 echo "Immutable deployment reference: $immutable_ref"
