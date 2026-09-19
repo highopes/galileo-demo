@@ -8,7 +8,6 @@ kubeconfig.*
 
 # Rendered manifests and temporary prompt patches.
 runtime/
-.runtime/
 
 # Local application environments and logs.
 .env

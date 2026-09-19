@@ -108,7 +108,7 @@ for secret_name in \
 done
 unset secret_name secret_value
 
-mkdir -p "${RUNTIME_DIR}" "${SCRIPT_DIR}/.runtime"
+mkdir -p "${RUNTIME_DIR}"
 cd "${WORKDIR}"
 
 kctl() {

@@ -74,7 +74,9 @@ if [[ "$PROFILE" == "status" ]]; then
   exit 0
 fi
 
-patch_file="$(mktemp "$ROOT_DIR/.runtime/prompt-config-patch.XXXXXX")"
+temp_dir="${RUNTIME_DIR:-$ROOT_DIR/runtime}"
+mkdir -p "$temp_dir"
+patch_file="$(mktemp "$temp_dir/prompt-config-patch.XXXXXX")"
 cleanup() {
   rm -f "$patch_file"
 }

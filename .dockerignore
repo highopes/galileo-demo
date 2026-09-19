@@ -3,7 +3,6 @@
 .agent-context/
 .env
 .env.*
-.runtime/
 runtime/
 kup.conf
 upstream/
