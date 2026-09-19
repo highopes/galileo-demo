@@ -1,12 +1,11 @@
 .git/
 .gitignore
 .agent-context/
-.deploy.env
 .env
 .env.*
-!.env.example
-.secrets/
 .runtime/
+runtime/
+kup.conf
 upstream/
 app/.venv/
 app/tests/

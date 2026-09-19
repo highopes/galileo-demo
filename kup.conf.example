@@ -1,0 +1,44 @@
+# Public defaults for deploying only the Galileo application to an ACK cluster
+# that already follows https://github.com/highopes/alicloud-ack-byocni.
+# Copy this file to kup.conf and replace every ReplaceMe placeholder.
+
+KUP_WORKDIR="${SCRIPT_DIR}"
+KUBECONFIG_FILE="${KUP_WORKDIR}/kubeconfig"
+ACK_CONTEXT="ack-byocni-demo"
+TEST_NAMESPACE="test"
+
+# These names, defaults, and meanings intentionally match the Galileo block in
+# alicloud-ack-byocni/kup.conf.example. A private config from that repository is
+# therefore also accepted by ./kup --galileo-only in this repository.
+GALILEO_NAMESPACE="galileo-demo"
+GALILEO_SOURCE_URL="https://github.com/highopes/galileo-demo"
+GALILEO_SOURCE_COMMIT="26ea7c0c3276cde94b6f5c1bff2b0d741d655858"
+GALILEO_IMAGE_REF="ReplaceMe"
+GALILEO_REGISTRY_SERVER="ReplaceMe"
+GALILEO_REGISTRY_USERNAME="ReplaceMe"
+GALILEO_REGISTRY_PASSWORD="ReplaceMe"
+GALILEO_SPLUNK_AO_API_KEY="ReplaceMe"
+GALILEO_SPLUNK_AO_PROJECT="Multi-Agent Banking Chatbot"
+GALILEO_SPLUNK_AO_AGENT_STREAM="Default Agent Stream"
+GALILEO_SPLUNK_AO_CONSOLE_URL="https://console.multitenant.galileocloud.io"
+GALILEO_APP_MODEL_PROVIDER="bailian"
+GALILEO_APP_MODEL_NAME="qwen3.7-flash"
+GALILEO_APP_MODEL_BASE_URL="ReplaceMe"
+GALILEO_APP_MODEL_API_KEY="ReplaceMe"
+GALILEO_MODEL_REQUEST_TIMEOUT="120"
+GALILEO_MODEL_MAX_RETRIES="2"
+GALILEO_PINECONE_API_KEY="ReplaceMe"
+GALILEO_PINECONE_INDEX_NAME="credit-card-information-qwen-demo"
+GALILEO_PINECONE_NAMESPACE="bank-docs"
+GALILEO_PINECONE_TEXT_FIELD="chunk_text"
+GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS="Action Advancement - Qwen,Action Completion - Qwen,Tool Errors - Qwen,Tool Selection Quality - Qwen"
+GALILEO_SPLUNK_AO_EXPERIMENT_DATASET=""
+GALILEO_SUPERVISOR_PROMPT_PROFILE="baseline"
+# Which baseline kup leaves active through the shared switch_prompt.sh:
+# qwen => custom app/prompts/supervisor-baseline-qwen.txt; official => baseline.
+GALILEO_BASELINE_PROMPT_VARIANT="qwen"
+GALILEO_PROMPT_SYNC_TIMEOUT_SEC="300"
+GALILEO_LOCAL_PORT="8000"
+
+RUNTIME_DIR="${KUP_WORKDIR}/runtime"
+ACK_API_TIMEOUT="10s"

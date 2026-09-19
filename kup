@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >&2; }
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_FILE="${KUP_CONFIG:-${SCRIPT_DIR}/kup.conf}"
+
+case "${1:-}" in
+  --galileo-only) ;;
+  -h|--help)
+    printf 'usage: %s --galileo-only\n' "$0"
+    printf 'This repository reconciles only the Galileo application; ACK lifecycle remains in alicloud-ack-byocni.\n'
+    exit 0
+    ;;
+  "") die "this repository manages only the application; use: $0 --galileo-only" ;;
+  *) die "unknown argument: $1; usage: $0 --galileo-only" ;;
+esac
+[[ "$#" -eq 1 ]] || die "too many arguments; usage: $0 --galileo-only"
+
+[[ -f "${CONFIG_FILE}" ]] || die "private config not found: ${CONFIG_FILE}; copy kup.conf.example to kup.conf first"
+chmod 600 "${CONFIG_FILE}"
+
+set -a
+# shellcheck disable=SC1090
+source "${CONFIG_FILE}"
+set +a
+
+WORKDIR="${KUP_WORKDIR:-${SCRIPT_DIR}}"
+KUBECONFIG_FILE="${KUBECONFIG_FILE:-${WORKDIR}/kubeconfig}"
+RUNTIME_DIR="${RUNTIME_DIR:-${WORKDIR}/runtime}"
+ACK_CONTEXT="${ACK_CONTEXT:-ack-byocni-demo}"
+ACK_API_TIMEOUT="${ACK_API_TIMEOUT:-10s}"
+TEST_NAMESPACE="${TEST_NAMESPACE:-test}"
+export GALILEO_SPLUNK_AO_EXPERIMENT_DATASET="${GALILEO_SPLUNK_AO_EXPERIMENT_DATASET:-}"
+
+require_var() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -n "${value}" ]] || die "required setting is empty: ${name}"
+  case "${value}" in
+    ReplaceMe|REPLACE_ME|replace-me|CONTACT.*) die "replace placeholder value for ${name} in the private kup.conf" ;;
+  esac
+}
+
+for command_name in kubectl python3; do
+  need "${command_name}"
+done
+
+for setting_name in \
+  ACK_CONTEXT TEST_NAMESPACE GALILEO_NAMESPACE GALILEO_SOURCE_URL GALILEO_SOURCE_COMMIT \
+  GALILEO_IMAGE_REF GALILEO_REGISTRY_SERVER GALILEO_REGISTRY_USERNAME \
+  GALILEO_REGISTRY_PASSWORD GALILEO_SPLUNK_AO_API_KEY GALILEO_SPLUNK_AO_PROJECT \
+  GALILEO_SPLUNK_AO_AGENT_STREAM GALILEO_SPLUNK_AO_CONSOLE_URL \
+  GALILEO_APP_MODEL_PROVIDER GALILEO_APP_MODEL_NAME GALILEO_APP_MODEL_BASE_URL \
+  GALILEO_APP_MODEL_API_KEY GALILEO_MODEL_REQUEST_TIMEOUT GALILEO_MODEL_MAX_RETRIES \
+  GALILEO_PINECONE_API_KEY GALILEO_PINECONE_INDEX_NAME GALILEO_PINECONE_NAMESPACE \
+  GALILEO_PINECONE_TEXT_FIELD GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS \
+  GALILEO_SUPERVISOR_PROMPT_PROFILE GALILEO_BASELINE_PROMPT_VARIANT \
+  GALILEO_PROMPT_SYNC_TIMEOUT_SEC GALILEO_LOCAL_PORT; do
+  require_var "${setting_name}"
+done
+
+[[ "${KUBECONFIG_FILE}" == "${WORKDIR}/"* ]] \
+  || die "KUBECONFIG_FILE must remain inside KUP_WORKDIR"
+[[ "${RUNTIME_DIR}" == "${WORKDIR}/"* ]] \
+  || die "RUNTIME_DIR must remain inside KUP_WORKDIR"
+
+for required_file in \
+  ns_galileo/multi-agent-banking.yaml app/prompts/supervisor-production-example.txt \
+  app/prompts/supervisor-baseline-qwen.txt scripts/switch_prompt.sh \
+  scripts/render_prompt_patch.py; do
+  [[ -f "${SCRIPT_DIR}/${required_file}" ]] || die "required file not found: ${SCRIPT_DIR}/${required_file}"
+done
+
+[[ "${GALILEO_SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]] \
+  || die "GALILEO_SOURCE_COMMIT must be a full lowercase Git commit SHA"
+[[ "${GALILEO_IMAGE_REF}" == "${GALILEO_REGISTRY_SERVER}/"*@sha256:* ]] \
+  || die "GALILEO_IMAGE_REF must be an immutable digest in GALILEO_REGISTRY_SERVER"
+galileo_image_digest="${GALILEO_IMAGE_REF##*@sha256:}"
+[[ "${galileo_image_digest}" =~ ^[0-9a-f]{64}$ ]] \
+  || die "GALILEO_IMAGE_REF must end in a complete lowercase sha256 digest"
+unset galileo_image_digest
+[[ "${GALILEO_APP_MODEL_BASE_URL}" == https://* ]] \
+  || die "GALILEO_APP_MODEL_BASE_URL must use HTTPS"
+case "${GALILEO_APP_MODEL_PROVIDER}" in
+  bailian|vllm) ;;
+  *) die "GALILEO_APP_MODEL_PROVIDER must be bailian or vllm" ;;
+esac
+case "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" in
+  baseline|improved) ;;
+  *) die "GALILEO_SUPERVISOR_PROMPT_PROFILE must be baseline or improved; use ./scripts/switch_prompt.sh for custom prompts" ;;
+esac
+case "${GALILEO_BASELINE_PROMPT_VARIANT}" in
+  official|qwen) ;;
+  *) die "GALILEO_BASELINE_PROMPT_VARIANT must be official or qwen" ;;
+esac
+[[ "${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}" =~ ^[1-9][0-9]*$ ]] \
+  || die "GALILEO_PROMPT_SYNC_TIMEOUT_SEC must be a positive integer"
+for secret_name in \
+  GALILEO_REGISTRY_PASSWORD GALILEO_SPLUNK_AO_API_KEY \
+  GALILEO_APP_MODEL_API_KEY GALILEO_PINECONE_API_KEY; do
+  secret_value="${!secret_name}"
+  [[ "${secret_value}" != *$'\n'* && "${secret_value}" != *$'\r'* ]] \
+    || die "${secret_name} contains an unsupported newline"
+done
+unset secret_name secret_value
+
+mkdir -p "${RUNTIME_DIR}" "${SCRIPT_DIR}/.runtime"
+cd "${WORKDIR}"
+
+kctl() {
+  kubectl \
+    --kubeconfig "${KUBECONFIG_FILE}" \
+    --context "${ACK_CONTEXT}" \
+    "$@"
+}
+
+render_template() {
+  local input_file="$1"
+  local output_file="$2"
+  python3 - "${input_file}" "${output_file}" <<'PY'
+import os
+import sys
+from string import Template
+
+source, destination = sys.argv[1:]
+with open(source, "r", encoding="utf-8") as handle:
+    rendered = Template(handle.read()).substitute(os.environ)
+with open(destination, "w", encoding="utf-8") as handle:
+    handle.write(rendered)
+PY
+}
+
+render_galileo_manifest() {
+  local output_file="$1"
+  local rendered_prompt_profile rendered_prompt_file
+
+  # Keep the checksum contract identical to alicloud-ack-byocni. Values read
+  # through envFrom trigger one application rollout; hot-loaded prompt values
+  # are deliberately excluded.
+  export GALILEO_POD_INPUTS_CHECKSUM
+  GALILEO_POD_INPUTS_CHECKSUM="$(python3 - <<'PY'
+import hashlib
+import json
+import os
+
+names = (
+    "GALILEO_SPLUNK_AO_API_KEY",
+    "GALILEO_SPLUNK_AO_PROJECT",
+    "GALILEO_SPLUNK_AO_AGENT_STREAM",
+    "GALILEO_SPLUNK_AO_CONSOLE_URL",
+    "GALILEO_APP_MODEL_PROVIDER",
+    "GALILEO_APP_MODEL_NAME",
+    "GALILEO_APP_MODEL_BASE_URL",
+    "GALILEO_APP_MODEL_API_KEY",
+    "GALILEO_MODEL_REQUEST_TIMEOUT",
+    "GALILEO_MODEL_MAX_RETRIES",
+    "GALILEO_PINECONE_API_KEY",
+    "GALILEO_PINECONE_INDEX_NAME",
+    "GALILEO_PINECONE_NAMESPACE",
+    "GALILEO_PINECONE_TEXT_FIELD",
+    "GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS",
+    "GALILEO_SPLUNK_AO_EXPERIMENT_DATASET",
+)
+payload = {name: os.environ[name] for name in names}
+encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+print(hashlib.sha256(encoded).hexdigest())
+PY
+)"
+
+  rendered_prompt_profile="${GALILEO_SUPERVISOR_PROMPT_PROFILE}"
+  rendered_prompt_file=""
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    rendered_prompt_profile="custom"
+    rendered_prompt_file="${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt"
+  fi
+  export GALILEO_RENDERED_PROMPT_PROFILE_JSON GALILEO_RENDERED_PROMPT_CUSTOM_JSON
+  GALILEO_RENDERED_PROMPT_PROFILE_JSON="$(python3 -c \
+    'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False))' \
+    "${rendered_prompt_profile}")"
+  GALILEO_RENDERED_PROMPT_CUSTOM_JSON="$(python3 -c \
+    'import json,pathlib,sys; print(json.dumps(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").strip(), ensure_ascii=False) if sys.argv[1] else json.dumps(""))' \
+    "${rendered_prompt_file}")"
+
+  render_template "${SCRIPT_DIR}/ns_galileo/multi-agent-banking.yaml" "${output_file}"
+  unset GALILEO_POD_INPUTS_CHECKSUM GALILEO_RENDERED_PROMPT_PROFILE_JSON
+  unset GALILEO_RENDERED_PROMPT_CUSTOM_JSON
+}
+
+wait_for_api() {
+  local attempt
+  for ((attempt = 1; attempt <= 120; attempt++)); do
+    if kctl --request-timeout="${ACK_API_TIMEOUT}" get --raw=/readyz >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 5
+  done
+  die "ACK API server did not become reachable"
+}
+
+ensure_namespace() {
+  local namespace="$1"
+  if ! kctl get namespace "${namespace}" >/dev/null 2>&1; then
+    kctl create namespace "${namespace}" >/dev/null
+  fi
+}
+
+create_galileo_secrets() {
+  (
+    local runtime_secret_file registry_auth_file
+    umask 077
+    runtime_secret_file="$(mktemp "${RUNTIME_DIR}/galileo-runtime-secret.XXXXXX")"
+    registry_auth_file="$(mktemp "${RUNTIME_DIR}/galileo-registry-auth.XXXXXX")"
+    trap 'rm -f -- "${runtime_secret_file}" "${registry_auth_file}"' EXIT
+
+    python3 - "${runtime_secret_file}" "${registry_auth_file}" <<'PY'
+import base64
+import json
+import os
+import sys
+from pathlib import Path
+
+runtime_path, registry_path = map(Path, sys.argv[1:])
+runtime_values = {
+    "SPLUNK_AO_API_KEY": os.environ["GALILEO_SPLUNK_AO_API_KEY"],
+    "APP_MODEL_API_KEY": os.environ["GALILEO_APP_MODEL_API_KEY"],
+    "PINECONE_API_KEY": os.environ["GALILEO_PINECONE_API_KEY"],
+}
+runtime_path.write_text(
+    "".join(f"{name}={value}\n" for name, value in runtime_values.items()),
+    encoding="utf-8",
+)
+
+server = os.environ["GALILEO_REGISTRY_SERVER"]
+username = os.environ["GALILEO_REGISTRY_USERNAME"]
+password = os.environ["GALILEO_REGISTRY_PASSWORD"]
+auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+registry_path.write_text(
+    json.dumps({"auths": {server: {"username": username, "password": password, "auth": auth}}}),
+    encoding="utf-8",
+)
+runtime_path.chmod(0o600)
+registry_path.chmod(0o600)
+PY
+
+    kctl -n "${GALILEO_NAMESPACE}" create secret generic splunk-ao-banking-qwen-runtime \
+      --from-env-file="${runtime_secret_file}" --dry-run=client -o yaml \
+      | kctl apply -f -
+    kctl -n "${GALILEO_NAMESPACE}" create secret generic galileo-registry-pull \
+      --type=kubernetes.io/dockerconfigjson \
+      --from-file=.dockerconfigjson="${registry_auth_file}" \
+      --dry-run=client -o yaml \
+      | kctl apply -f -
+  )
+}
+
+validate_service_endpoint() {
+  local namespace="$1"
+  local service="$2"
+  local endpoint attempt
+  for ((attempt = 1; attempt <= 60; attempt++)); do
+    endpoint="$(kctl -n "${namespace}" get endpointslices.discovery.k8s.io \
+      -l "kubernetes.io/service-name=${service}" \
+      -o jsonpath='{.items[0].endpoints[0].addresses[0]}' 2>/dev/null || true)"
+    if [[ -n "${endpoint}" ]]; then
+      return 0
+    fi
+    sleep 5
+  done
+  kctl -n "${namespace}" describe service "${service}" || true
+  die "service did not get a ready endpoint: ${namespace}/${service}"
+}
+
+validate_galileo_prompt_runtime() {
+  local app_pod="$1"
+  local expected_profile expected_custom_hash configured_state configured_profile
+  local configured_custom_hash mounted_profile resolved_profile resolved_prompt_hash
+  local deadline runtime_info
+
+  expected_profile="${GALILEO_SUPERVISOR_PROMPT_PROFILE}"
+  expected_custom_hash=""
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    expected_profile="custom"
+    expected_custom_hash="$(python3 - "${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+prompt = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+print(hashlib.sha256(prompt.encode("utf-8")).hexdigest())
+PY
+)"
+  fi
+
+  kctl -n "${GALILEO_NAMESPACE}" get deployment splunk-ao-banking-qwen -o json | python3 -c '
+import json, sys
+
+deployment = json.load(sys.stdin)
+spec = deployment["spec"]["template"]["spec"]
+container = next(item for item in spec["containers"] if item["name"] == "banking-chatbot")
+environment = {item["name"]: item.get("value") for item in container.get("env", [])}
+expected_environment = {
+    "SUPERVISOR_PROMPT_PROFILE_FILE": "/etc/banking-prompt/SUPERVISOR_PROMPT_PROFILE",
+    "SUPERVISOR_PROMPT_CUSTOM_FILE": "/etc/banking-prompt/SUPERVISOR_PROMPT_CUSTOM",
+}
+if any(environment.get(name) != value for name, value in expected_environment.items()):
+    raise SystemExit("Galileo prompt file environment is missing or incorrect")
+mount = next((item for item in container.get("volumeMounts", []) if item.get("name") == "supervisor-prompt"), None)
+if not mount or mount.get("mountPath") != "/etc/banking-prompt" or not mount.get("readOnly"):
+    raise SystemExit("Galileo projected prompt volume mount is missing or incorrect")
+volume = next((item for item in spec.get("volumes", []) if item.get("name") == "supervisor-prompt"), None)
+if not volume or volume.get("configMap", {}).get("name") != "splunk-ao-banking-qwen-config":
+    raise SystemExit("Galileo projected prompt ConfigMap volume is missing or incorrect")
+items = {item.get("key"): item.get("path") for item in volume["configMap"].get("items", [])}
+expected_items = {
+    "SUPERVISOR_PROMPT_PROFILE": "SUPERVISOR_PROMPT_PROFILE",
+    "SUPERVISOR_PROMPT_CUSTOM": "SUPERVISOR_PROMPT_CUSTOM",
+}
+if items != expected_items:
+    raise SystemExit("Galileo projected prompt ConfigMap items are missing or incorrect")
+'
+
+  configured_state="$(kctl -n "${GALILEO_NAMESPACE}" get configmap \
+    splunk-ao-banking-qwen-config -o json | python3 -c '
+import hashlib, json, sys
+data = json.load(sys.stdin).get("data", {})
+custom = data.get("SUPERVISOR_PROMPT_CUSTOM", "")
+digest = hashlib.sha256(custom.encode("utf-8")).hexdigest() if custom else ""
+print(data.get("SUPERVISOR_PROMPT_PROFILE", "") + "\t" + digest)
+')"
+  IFS=$'\t' read -r configured_profile configured_custom_hash <<< "${configured_state}"
+  [[ "${configured_profile}" == "${expected_profile}" ]] \
+    || die "Galileo ConfigMap prompt profile does not match the configured prompt selection"
+  [[ "${configured_custom_hash}" == "${expected_custom_hash}" ]] \
+    || die "Galileo ConfigMap custom prompt does not match the configured prompt selection"
+
+  deadline=$((SECONDS + GALILEO_PROMPT_SYNC_TIMEOUT_SEC))
+  while (( SECONDS < deadline )); do
+    runtime_info="$(kctl -n "${GALILEO_NAMESPACE}" exec "${app_pod}" -- python -c \
+      'import os; from hashlib import sha256; from pathlib import Path; from src.splunk_ao_langgraph_fsi_agent.prompt_profiles import resolve_supervisor_prompt; p,v=resolve_supervisor_prompt(); print(Path(os.environ["SUPERVISOR_PROMPT_PROFILE_FILE"]).read_text().strip()+"\t"+p+"\t"+sha256(v.encode()).hexdigest())' \
+      2>/dev/null || true)"
+    IFS=$'\t' read -r mounted_profile resolved_profile resolved_prompt_hash <<< "${runtime_info}"
+    if [[ "${mounted_profile}" == "${expected_profile}" && \
+      "${resolved_profile}" == "${expected_profile}" ]] && \
+      { [[ "${expected_profile}" != "custom" ]] || \
+        [[ "${resolved_prompt_hash}" == "${expected_custom_hash}" ]]; }; then
+      log "Galileo prompt ConfigMap, projected volume, and application resolver use ${expected_profile}"
+      return 0
+    fi
+    (( SECONDS < deadline )) || break
+    sleep 2
+  done
+  die "Galileo prompt projection did not converge to the configured prompt selection within ${GALILEO_PROMPT_SYNC_TIMEOUT_SEC}s"
+}
+
+apply_galileo_initial_prompt() {
+  local -a prompt_args
+  if [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" && \
+    "${GALILEO_BASELINE_PROMPT_VARIANT}" == "qwen" ]]; then
+    log "hot-load the Qwen baseline through the Galileo custom prompt ConfigMap"
+    prompt_args=(custom "${SCRIPT_DIR}/app/prompts/supervisor-baseline-qwen.txt")
+  elif [[ "${GALILEO_SUPERVISOR_PROMPT_PROFILE}" == "baseline" ]]; then
+    log "keep the immutable image's official baseline prompt"
+    prompt_args=(baseline)
+  else
+    log "keep the configured Galileo ${GALILEO_SUPERVISOR_PROMPT_PROFILE} prompt profile"
+    prompt_args=(improved)
+  fi
+  KUBECONFIG_FILE="${KUBECONFIG_FILE}" \
+    KUBE_CONTEXT="${ACK_CONTEXT}" \
+    KUBE_NAMESPACE="${GALILEO_NAMESPACE}" \
+    "${SCRIPT_DIR}/scripts/switch_prompt.sh" "${prompt_args[@]}"
+}
+
+validate_galileo_runtime() {
+  local deployed_image source_pod app_pod attempt
+  deployed_image="$(kctl -n "${GALILEO_NAMESPACE}" get deployment splunk-ao-banking-qwen \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="banking-chatbot")].image}')"
+  [[ "${deployed_image}" == "${GALILEO_IMAGE_REF}" ]] \
+    || die "Galileo deployment image does not match GALILEO_IMAGE_REF"
+
+  validate_service_endpoint "${GALILEO_NAMESPACE}" splunk-ao-banking-qwen
+  source_pod="$(kctl -n "${TEST_NAMESPACE}" get pod -l app=testcurl \
+    -o jsonpath='{.items[0].metadata.name}')"
+  [[ -n "${source_pod}" ]] || die "no testcurl pod is available for Galileo HTTP validation"
+  kctl -n "${TEST_NAMESPACE}" exec "${source_pod}" -- curl -fsS --max-time 30 \
+    "http://splunk-ao-banking-qwen.${GALILEO_NAMESPACE}.svc.cluster.local/" >/dev/null
+
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    app_pod="$(kctl -n "${GALILEO_NAMESPACE}" get pod \
+      -l app.kubernetes.io/name=splunk-ao-banking-qwen -o json | python3 -c '
+import json, sys
+for pod in json.load(sys.stdin).get("items", []):
+    if pod.get("metadata", {}).get("deletionTimestamp"):
+        continue
+    conditions = pod.get("status", {}).get("conditions", [])
+    if any(item.get("type") == "Ready" and item.get("status") == "True" for item in conditions):
+        print(pod["metadata"]["name"])
+        break
+')"
+    if [[ -n "${app_pod}" ]]; then
+      validate_galileo_prompt_runtime "${app_pod}"
+      if kctl -n "${GALILEO_NAMESPACE}" exec "${app_pod}" -- python pod_network_smoke.py; then
+        log "Galileo banking chatbot prompt switching, image, HTTP service, model, Pinecone, and Splunk AO checks passed"
+        return 0
+      fi
+    fi
+    if (( attempt < 3 )); then
+      log "Galileo Pod validation attempt ${attempt}/3 failed; retry in 5 seconds"
+      sleep 5
+    fi
+  done
+  die "Galileo Pod outbound validation failed"
+}
+
+log "preflight: Galileo-only reconciliation"
+kubectl version --client
+bash -n "${SCRIPT_DIR}/kup"
+bash -n "${SCRIPT_DIR}/scripts/switch_prompt.sh"
+python3 -c 'compile(open(__import__("sys").argv[1], encoding="utf-8").read(), __import__("sys").argv[1], "exec")' \
+  "${SCRIPT_DIR}/scripts/render_prompt_patch.py"
+
+[[ -s "${KUBECONFIG_FILE}" ]] || die "project kubeconfig not found or empty: ${KUBECONFIG_FILE}; copy the private ACK kubeconfig here first"
+chmod 600 "${KUBECONFIG_FILE}"
+wait_for_api
+
+GALILEO_MANIFEST="${RUNTIME_DIR}/galileo-multi-agent-banking.yaml"
+render_galileo_manifest "${GALILEO_MANIFEST}"
+
+log "reconcile only the Galileo multi-agent banking chatbot"
+ensure_namespace "${GALILEO_NAMESPACE}"
+create_galileo_secrets
+kctl apply -f "${GALILEO_MANIFEST}"
+kctl -n "${GALILEO_NAMESPACE}" rollout status \
+  deployment/splunk-ao-banking-qwen --timeout=15m
+kctl -n "${GALILEO_NAMESPACE}" wait --for=condition=Ready pod \
+  -l app.kubernetes.io/name=splunk-ao-banking-qwen --timeout=15m
+apply_galileo_initial_prompt
+validate_galileo_runtime
+kctl -n "${GALILEO_NAMESPACE}" get deployment,pods,service -o wide
+log "SUCCESS: Galileo banking chatbot reconciled; ACK infrastructure and platform add-ons were not changed"

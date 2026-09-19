@@ -1,11 +1,48 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${GALILEO_NAMESPACE}
+  labels:
+    app.kubernetes.io/part-of: splunk-ao-banking-qwen-demo
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: splunk-ao-banking-qwen-config
+  namespace: ${GALILEO_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: splunk-ao-banking-qwen
+data:
+  SPLUNK_AO_PROJECT: "${GALILEO_SPLUNK_AO_PROJECT}"
+  SPLUNK_AO_AGENT_STREAM: "${GALILEO_SPLUNK_AO_AGENT_STREAM}"
+  SPLUNK_AO_CONSOLE_URL: "${GALILEO_SPLUNK_AO_CONSOLE_URL}"
+  APP_MODEL_PROVIDER: "${GALILEO_APP_MODEL_PROVIDER}"
+  APP_MODEL_NAME: "${GALILEO_APP_MODEL_NAME}"
+  APP_MODEL_BASE_URL: "${GALILEO_APP_MODEL_BASE_URL}"
+  MODEL_REQUEST_TIMEOUT: "${GALILEO_MODEL_REQUEST_TIMEOUT}"
+  MODEL_MAX_RETRIES: "${GALILEO_MODEL_MAX_RETRIES}"
+  PINECONE_INDEX_NAME: "${GALILEO_PINECONE_INDEX_NAME}"
+  PINECONE_NAMESPACE: "${GALILEO_PINECONE_NAMESPACE}"
+  PINECONE_TEXT_FIELD: "${GALILEO_PINECONE_TEXT_FIELD}"
+  SPLUNK_AO_EXPERIMENT_EVALUATORS: "${GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS}"
+  SPLUNK_AO_EXPERIMENT_DATASET: "${GALILEO_SPLUNK_AO_EXPERIMENT_DATASET}"
+  SUPERVISOR_PROMPT_PROFILE: ${GALILEO_RENDERED_PROMPT_PROFILE_JSON}
+  SUPERVISOR_PROMPT_CUSTOM: ${GALILEO_RENDERED_PROMPT_CUSTOM_JSON}
+  GALILEO_SOURCE_URL: "${GALILEO_SOURCE_URL}"
+  GALILEO_SOURCE_COMMIT: "${GALILEO_SOURCE_COMMIT}"
+  OTEL_SERVICE_NAME: "splunk-ao-banking-qwen-demo-ack"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: splunk-ao-banking-qwen
-  namespace: ${ACK_NAMESPACE}
+  namespace: ${GALILEO_NAMESPACE}
   labels:
     app.kubernetes.io/name: splunk-ao-banking-qwen
     app.kubernetes.io/part-of: splunk-ao-banking-qwen-demo
+  annotations:
+    demo.openai.com/source: "${GALILEO_SOURCE_URL}"
+    demo.openai.com/source-revision: "${GALILEO_SOURCE_COMMIT}"
 spec:
   replicas: 1
   strategy:
@@ -18,10 +55,14 @@ spec:
       labels:
         app.kubernetes.io/name: splunk-ao-banking-qwen
         app.kubernetes.io/part-of: splunk-ao-banking-qwen-demo
+      annotations:
+        demo.openai.com/source: "${GALILEO_SOURCE_URL}"
+        demo.openai.com/source-revision: "${GALILEO_SOURCE_COMMIT}"
+        demo.openai.com/pod-inputs-checksum: "${GALILEO_POD_INPUTS_CHECKSUM}"
     spec:
       automountServiceAccountToken: false
       imagePullSecrets:
-        - name: registry-pull
+        - name: galileo-registry-pull
       securityContext:
         runAsNonRoot: true
         runAsUser: 999
@@ -30,7 +71,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: banking-chatbot
-          image: ${IMAGE_REF}
+          image: ${GALILEO_IMAGE_REF}
           imagePullPolicy: Always
           ports:
             - name: http
@@ -42,8 +83,6 @@ spec:
             - secretRef:
                 name: splunk-ao-banking-qwen-runtime
           env:
-            # Projected ConfigMap files update in-place. New Chainlit sessions read
-            # these paths, so prompt A/B switches do not restart the Pod.
             - name: SUPERVISOR_PROMPT_PROFILE_FILE
               value: /etc/banking-prompt/SUPERVISOR_PROMPT_PROFILE
             - name: SUPERVISOR_PROMPT_CUSTOM_FILE
@@ -92,3 +131,20 @@ spec:
               - key: SUPERVISOR_PROMPT_CUSTOM
                 path: SUPERVISOR_PROMPT_CUSTOM
       terminationGracePeriodSeconds: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: splunk-ao-banking-qwen
+  namespace: ${GALILEO_NAMESPACE}
+  labels:
+    app.kubernetes.io/name: splunk-ao-banking-qwen
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: splunk-ao-banking-qwen
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP

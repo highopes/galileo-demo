@@ -1,119 +1,232 @@
 # Splunk AO Multi-Agent Banking Chatbot — ACK + Qwen Demo
 
-这是 Splunk Agent Observability（Splunk AO）官方 Multi-agent banking chatbot 的 ACK 部署版本。它保留官方 demo 的一个**故意缺陷**：第一版 supervisor prompt 只描述 credit-card agent，没有描述已经存在的 credit-score agent。它可能正确调用 score agent 和工具、取得 `550`，却在回到 supervisor 后漏答或触发兜底拒绝；也可能直接拒绝或碰巧正确回答。这种不确定性和无效 Token 消耗正是第一阶段要观察的问题。第二阶段只改善 prompt，使信用卡与信用评分问题得到正确回答，而银行业务之外的问题继续拒绝。
+这是 Splunk Agent Observability Multi-agent banking chatbot 的 ACK 演示实现。应用通过 Chainlit 展示 LangGraph supervisor、credit-card agent、credit-score agent、Pinecone 检索与 Splunk Agent Observability trace，并通过可热切换的 supervisor prompt 对比故障版与改进版行为。
 
-本项目的重点不是证明“Agent 某一次回答正确”，而是展示 Splunk AO 如何把多 Agent 应用的质量改进变成可观测、可解释、可重复比较的工程流程。
+本仓库的 ACK 部署和运维约定与 [alicloud-ack-byocni](https://github.com/highopes/alicloud-ack-byocni) 完全共用一套 Galileo contract：
 
-权威参考：
+- 私有配置统一为 `kup.conf`，应用设置统一使用 `GALILEO_*` 变量。
+- 应用收敛统一使用 `./kup --galileo-only`。
+- Kubernetes 模板统一为 `ns_galileo/multi-agent-banking.yaml`。
+- Secret、ConfigMap、Pod 输入校验和、滚动更新和验收检查采用相同逻辑。
+- Prompt 维护统一使用 `scripts/switch_prompt.sh` 和 `scripts/render_prompt_patch.py`。
+- 项目私有 kubeconfig、固定 context、ClusterIP 和本地 port-forward 采用相同安全边界。
 
-- [Splunk AO 官方 Multi-agent banking chatbot sample](https://agent-observability-docs.splunk.com/getting-started/sample-projects/multi-agent)
-- [Splunk AO Multi-agent LangGraph evaluations cookbook](https://agent-observability-docs.splunk.com/cookbooks/use-cases/multi-agent-langgraph/multi-agent-langgraph)
-- [Splunk AO experiments framework](https://agent-observability-docs.splunk.com/sdk-api/experiments/experiments)
-- [Alibaba Cloud ACK kubeconfig API](https://help.aliyun.com/en/ack/ack-managed-and-ack-dedicated/developer-reference/api-query-the-kubeconfig-file-of-a-cluster)
-- [Pinecone integrated embedding indexes](https://docs.pinecone.io/guides/indexes/create-an-index)
+本仓库不创建或销毁 ACK、VPC、Worker、Cilium、Hubble、Timescape、Tetragon 或测试 workload。完整 ACK 环境仍由 `alicloud-ack-byocni` 的 `./kup` 和 `./kiall` 管理；本仓库只提供相同的 Galileo-only 手工收敛入口。
 
-## 当前 Demo 的核心边界
+## Demo 目标
 
-- 应用首选 vLLM `Qwen/Qwen3-14B-FP8`。
-- 只有 vLLM 普通 Chat 通过、实际 Tool Calling capability 不通过时，才切换应用到百炼 `qwen3.7-flash`。
-- 本次 preflight 满足上述 fallback 条件，ACK 应用使用百炼 `qwen3.7-flash`。
-- Splunk AO 的四个 Judge/Evaluator 仍使用现有 vLLM Qwen Integration，不随应用 fallback 改动。
-- 不通过脚本修改 Splunk AO Project、Agent Stream、Integration、Evaluator、enablement、sampling 或 Dataset。
-- 原有 Pinecone `credit-card-information` 永远只读；本 demo 使用隔离的 integrated-embedding index。
-- ACK 每次从 `alicloud-ack-byocni` 当前 Terraform state 和私有 kubeconfig 动态发现，不保存长期固定 cluster ID。
-- 只创建 ClusterIP Service，通过 port-forward 演示；不创建新的公网入口。
+第一阶段使用故意不完整的 supervisor prompt：credit-score agent 和工具可以成功返回 `550`，但 supervisor 可能因为没有被明确告知如何处理该能力而漏答或拒绝。第二阶段只把 prompt 切换到 `improved`，不更换镜像、模型、Pinecone 数据或 Evaluator，从而在 Splunk AO 中对比相同系统的两种 Agent 行为。
 
-## 架构
+默认 `kup.conf.example` 与 ACK 项目保持相同选择：
 
-```mermaid
-flowchart LR
-    Browser[Browser / Chainlit] -->|port-forward| ACK[ACK Pod]
-    ACK --> Supervisor[LangGraph Supervisor]
-    Supervisor --> Card[Credit Card Agent]
-    Supervisor --> Score[Credit Score Agent]
-    Card --> Pinecone[(Pinecone integrated search)]
-    Score --> ScoreTool[Credit Score Tool]
-    Supervisor --> AppLLM[Application LLM\nBailian qwen3.7-flash]
-    ACK --> AO[Splunk Agent Observability]
-    AO --> Evals[4 Qwen Evaluators]
-    Evals --> Judge[vLLM Qwen3-14B-FP8 Judge]
-```
+- application model：`bailian/qwen3.7-flash`
+- Pinecone index：`credit-card-information-qwen-demo`
+- Pinecone namespace：`bank-docs`
+- 初始 prompt：Qwen baseline，通过 `custom app/prompts/supervisor-baseline-qwen.txt` 热加载
+- Service：ClusterIP，不创建 Ingress 或公网 LoadBalancer
 
-应用 Pod 不运行模型，因此 ACK 节点不需要 GPU。Splunk AO 数据链路记录 supervisor、sub-agent、tool、model 调用与时间信息；Evaluator 在这些执行证据上给出分数和解释。
+这些只是公共默认值。API key、endpoint、镜像 digest 和 registry credential 必须写入 Git 忽略的私有 `kup.conf`。
 
-## 目录
+## 架构与职责边界
 
 ```text
-.agent-context/SPLUNK_AO_ACK_QWEN_TASK.md  主约束和验收标准
-.deploy.env                                非 Secret 部署配置
-.secrets/                                  本地 Secret（Git ignored）
-.runtime/                                  动态发现和构建结果（Git ignored）
-app/                                       Chainlit/LangGraph 应用
-deploy/k8s/                                无 Secret Kubernetes 模板
-scripts/preflight_models.py                模型与 Tool Calling preflight
-scripts/setup_pinecone.py                  Pinecone 安全 inventory/resolve/smoke
-scripts/local_smoke.py                     baseline 观测，不把故意失败当测试失败
-scripts/discover_ack.sh                     动态 ACK 发现
-scripts/build_push.sh                       amd64 build、容器 smoke、Docker Hub push
-scripts/push_acr.sh                         将同一镜像推送到用户已有 ACR repository
-scripts/build_push_acr.sh                   直接 build/smoke/push 到已有 ACR
-scripts/deploy_ack.sh                       namespace 内部署
-scripts/deploy_kubernetes.sh                任意 Kubernetes 环境部署
-scripts/validate_ack_network.sh             Pod 出站验证
-scripts/port_forward.sh                     私有访问入口
-scripts/switch_prompt.sh                     baseline/improved/custom prompt 一键切换
-scripts/run_experiment.sh                   有界 Experiment runner
-Dockerfile                                 非 root Python 3.12 镜像
+Browser
+  |
+  | kubectl port-forward
+  v
+ClusterIP Service / galileo-demo
+  |
+  v
+Chainlit + LangGraph Pod
+  |-- Supervisor
+  |    |-- Credit Card Agent --> Pinecone integrated search
+  |    `-- Credit Score Agent --> deterministic score tool
+  |-- Bailian or vLLM application model
+  `-- Splunk Agent Observability
+
+ACK/VPC/Cilium/Hubble/Tetragon lifecycle
+  `-- owned only by alicloud-ack-byocni
 ```
 
-## Secret 配置
+应用 Pod 不运行模型，不需要 GPU。它只保存三类运行期 Secret：Splunk AO API key、最终 application model API key 和 Pinecone API key。Alibaba RAM AccessKey、ACR push credential、Docker Hub credential、Judge key 和 ACK Node 密码不会进入 Pod。
 
-真实 Secret 只能放在以下已忽略、权限为 0600 的文件中：
+## 仓库中的部署组件
 
-### `.secrets/runtime.env`
-
-```dotenv
-SPLUNK_AO_API_KEY="..."
-VLLM_API_KEY="..."
-DASHSCOPE_API_KEY="..."
-PINECONE_API_KEY="..."
+```text
+kup.conf.example                         唯一私有配置模板
+kup                                      Galileo-only 收敛入口
+ns_galileo/multi-agent-banking.yaml      与 ACK 项目一致的资源模板
+scripts/switch_prompt.sh                 baseline/improved/custom 热切换
+scripts/render_prompt_patch.py           安全生成 ConfigMap patch
+scripts/load_galileo_config.sh           本地运行时的 GALILEO_* 映射
+scripts/run_local.sh                      使用同一 kup.conf 本地运行
+scripts/local_smoke.py                    使用同一 kup.conf 做本地 smoke
+scripts/run_experiment.sh                 使用同一 kup.conf 运行 Experiment
+Dockerfile                               应用镜像定义
+app/                                     Chainlit/LangGraph 应用与测试
 ```
 
-### `.secrets/dockerhub.env`
+旧的 `.deploy.env`、`.secrets/*.env` 部署输入、ACK 动态发现、独立 build/push/deploy/port-forward 脚本以及 `deploy/k8s` 多文件模板已经移除。不要恢复这些入口，否则两个仓库会重新形成两套配置与运维方式。
 
-```dotenv
-DOCKERHUB_USERNAME="..."
-DOCKERHUB_PAT="..."
+## 前置条件
+
+### ACK 环境
+
+目标集群应已按 `alicloud-ack-byocni` 建成，并满足：
+
+- 项目私有 kubeconfig 可用，默认文件为仓库根目录的 `kubeconfig`。
+- kubeconfig 中存在稳定 context `ack-byocni-demo`。
+- ACK API 可访问，节点和 CNI 已 Ready。
+- `test` namespace 中存在 label 为 `app=testcurl` 的测试 Pod。Galileo-only 收敛会像 ACK 项目一样从该 Pod 验证跨 namespace ClusterIP HTTP，不会静默跳过。
+- 本机已安装 `kubectl` 和 Python 3。
+
+如果尚未创建 ACK 环境，请先在 `alicloud-ack-byocni` 中完成 `./kup`。本仓库不会读取 Terraform state、调用 Alibaba Cloud API、创建集群或修复 kubeconfig。
+
+### 外部服务
+
+准备以下已有资源：
+
+- 一个已发布的 `linux/amd64` 应用镜像，必须使用完整不可变 `@sha256:` reference。
+- 对该镜像有 pull 权限的 registry credential。
+- Splunk AO Project、Agent Stream 和 API key。
+- 支持 OpenAI-compatible API 的 Bailian 或 vLLM endpoint、精确 model ID 和 API key。
+- 已准备好数据的 Pinecone integrated-embedding index、namespace、text field 和 API key。
+
+本仓库的收敛脚本不会创建 ACR repository、Pinecone index、Splunk AO Project、Agent Stream、Evaluator 或 Dataset，也不会构建和推送镜像。镜像应通过组织批准的构建流程从本仓库 `Dockerfile` 生成；更新镜像时同时更新 `GALILEO_SOURCE_COMMIT` 和 `GALILEO_IMAGE_REF`，禁止使用 `latest` 或可变 tag 作为部署引用。
+
+## 配置
+
+```bash
+cp kup.conf.example kup.conf
+cp /path/to/ack-byocni/kubeconfig ./kubeconfig
+chmod 600 kup.conf kubeconfig
 ```
 
-使用 Docker Hub PAT，不使用账号密码。ACK runtime Secret 只注入最终应用 provider 的一个 key；当前 fallback 到百炼，因此 Pod 不注入 `VLLM_API_KEY`。Judge key 属于 Splunk AO 控制面，不因应用 fallback 注入 Pod。
+然后编辑私有 `kup.conf`。至少替换：
 
-### `.secrets/acr.env`
+| 变量 | 含义 |
+|---|---|
+| `GALILEO_IMAGE_REF` | registry 中完整的 `linux/amd64` 不可变 digest reference |
+| `GALILEO_REGISTRY_SERVER` | 与镜像 reference 匹配的 registry host |
+| `GALILEO_REGISTRY_USERNAME` | 镜像 pull 用户名 |
+| `GALILEO_REGISTRY_PASSWORD` | 镜像 pull 密码或 token |
+| `GALILEO_SPLUNK_AO_API_KEY` | Splunk AO API key |
+| `GALILEO_APP_MODEL_BASE_URL` | HTTPS OpenAI-compatible base URL |
+| `GALILEO_APP_MODEL_API_KEY` | application model API key |
+| `GALILEO_PINECONE_API_KEY` | Pinecone API key |
 
-```dotenv
-ACR_REGISTRY="已有 ACR registry host"
-ACR_REPOSITORY="已有 ACR registry host/highope/multi-agent-banking"
-ACR_USERNAME="..."
-ACR_PASSWORD="..."
+同时核对 Project、Agent Stream、model、Pinecone index/namespace/text field、Evaluator 列表和可选 Dataset。`GALILEO_SOURCE_COMMIT` 必须是该镜像实际对应的 40 位小写 Git SHA；示例值与 `alicloud-ack-byocni` 当前部署基线一致，不表示任意新镜像都对应这个 commit。
+
+`kup.conf`、`kubeconfig`、`runtime/` 和 `.runtime/` 都被 Git 忽略。脚本将前两者权限收敛为 0600。Kubernetes runtime Secret 和 registry auth 只通过 0600 临时文件生成，应用后立即删除；持久化的 rendered manifest 不包含 Secret 值。
+
+如果需要复用 ACK 仓库的私有配置，可把同一份 `kup.conf` 复制到本仓库；Galileo 相关变量、路径语义和默认 context 完全兼容。若原文件把 `KUP_WORKDIR` 写成 ACK 仓库的绝对路径，复制后应改成本仓库绝对路径，或恢复为示例中的 `${SCRIPT_DIR}`，以免 rendered file 写回参考仓库。不要用 symlink 让两个仓库共享会被误编辑的 Secret 文件。
+
+## 部署或刷新 Galileo
+
+```bash
+./kup --galileo-only
 ```
 
-`ACR_REPOSITORY` 是完整 repository 路径，其最后一段必须是 `multi-agent-banking`。脚本只使用用户已配置的 ACR，不创建 ACR instance、namespace、repository 或公网 ACK 资源；密码仅进入临时 Docker config 和 Kubernetes image pull Secret。
+这是本仓库唯一的 ACK 部署/配置刷新入口。命令按以下顺序执行：
 
-### `.secrets/alicloud.env`
+1. 检查 `kubectl`、Python、脚本语法、配置占位符、完整 source SHA、HTTPS model URL 和不可变 image digest。
+2. 显式使用私有 kubeconfig 与 `ACK_CONTEXT` 检查 `/readyz`，不读取或改变全局 current-context。
+3. 生成 `runtime/galileo-multi-agent-banking.yaml`。
+4. 创建 namespace（若不存在），并收敛 `splunk-ao-banking-qwen-runtime` 与 `galileo-registry-pull` 两个 Secret。
+5. 应用 ConfigMap、Deployment 和 ClusterIP Service。
+6. 等待唯一应用 Pod rollout 和 Ready。
+7. 按 `kup.conf` 收敛 baseline/improved prompt。
+8. 验证 image reference、Service endpoint、跨 namespace HTTP、projected prompt、应用 resolver、精确 model ID、Pinecone search 和 Splunk AO HTTPS。
 
-仅在 ACK repo kubeconfig 缺失或失效、需要通过 ACK OpenAPI 动态重新取得当前 kubeconfig 时读取：
+该命令不会运行 Terraform，不会升级或重启 ACK Node、Cilium、Hubble、Timescape、Tetragon 或其他 workload。
 
-```dotenv
-ALIBABA_CLOUD_ACCESS_KEY_ID="..."
-ALIBABA_CLOUD_ACCESS_KEY_SECRET="..."
-ALIBABA_CLOUD_REGION="..."
+### 参数怎样生效
+
+| `kup.conf` 修改类型 | 生效方式 | 影响范围 |
+|---|---|---|
+| Splunk AO、model、Pinecone key 或非 Secret runtime 参数 | `./kup --galileo-only` 更新 Secret/ConfigMap；Pod 模板校验和变化后滚动 | 只替换 Chatbot Pod |
+| `GALILEO_IMAGE_REF`、`GALILEO_SOURCE_COMMIT` | 应用新不可变镜像与来源标记 | 只滚动 Chatbot Deployment |
+| registry pull 用户名或密码 | 重建 imagePullSecret | 只影响以后的镜像拉取；镜像未变时不强制滚动 |
+| `GALILEO_SUPERVISOR_PROMPT_PROFILE`、`GALILEO_BASELINE_PROMPT_VARIANT` | projected ConfigMap 热加载 | Pod 与镜像保持不变 |
+| 临时 baseline/improved/custom 切换 | `scripts/switch_prompt.sh` | Pod 与镜像保持不变 |
+| `GALILEO_LOCAL_PORT`、`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` | 下次本地访问或收敛时读取 | 不单独修改 workload |
+
+Secret 和普通 `envFrom` 值只在进程启动时读取，因此只编辑 `kup.conf` 或只手工 patch Secret 不会改变现有进程。应重新运行 `./kup --galileo-only`，让 checksum 驱动一次可验证的 RollingUpdate。若修改 `GALILEO_NAMESPACE`，脚本会在新 namespace 部署另一套应用，不会猜测并删除旧 namespace；这应视为迁移。
+
+## 查看状态与访问 Web
+
+定义只读 wrapper：
+
+```bash
+kctl() {
+  kubectl --kubeconfig ./kubeconfig --context ack-byocni-demo "$@"
+}
 ```
 
-脚本不会将 kubeconfig 合并到 `~/.kube/config`。
+查看资源：
 
-## Phase 0–5：本地准备与验证
+```bash
+kctl -n galileo-demo get deployment,pods,service
+kctl -n galileo-demo get deployment splunk-ao-banking-qwen \
+  -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+./scripts/switch_prompt.sh status
+```
 
-### 1. Python 环境
+本地访问：
+
+```bash
+kubectl \
+  --kubeconfig ./kubeconfig \
+  --context ack-byocni-demo \
+  -n galileo-demo \
+  port-forward svc/splunk-ao-banking-qwen 8000:80
+```
+
+打开 <http://127.0.0.1:8000>。Service 保持 ClusterIP；不要为了演示创建公网 LoadBalancer。
+
+## Prompt 演示与维护
+
+`scripts/switch_prompt.sh` 默认读取同一份 `kup.conf` 中的 kubeconfig、ACK context 和 Galileo namespace。需要临时指向另一个集群时，可显式设置：
+
+```bash
+export KUBECONFIG_FILE="$PWD/kubeconfig"
+export KUBE_CONTEXT="ack-byocni-demo"
+export KUBE_NAMESPACE="galileo-demo"
+```
+
+三种运行时状态与 ACK 项目一致：
+
+| 演示提示词 | 命令 | profile / Session 标签 |
+|---|---|---|
+| 官方 baseline | `./scripts/switch_prompt.sh baseline` | `baseline` / `[baseline]` |
+| Qwen baseline | `./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt` | `custom` / `[custom]` |
+| 改进版 | `./scripts/switch_prompt.sh improved` | `improved` / `[improved]` |
+
+任意自定义 prompt：
+
+```bash
+./scripts/switch_prompt.sh custom app/prompts/supervisor-production-example.txt
+./scripts/switch_prompt.sh custom /absolute/path/to/supervisor-prompt.txt
+```
+
+脚本拒绝空文件和大于 100 KiB 的内容，patch 后等待 projected ConfigMap 和应用 resolver 收敛，并对 custom 内容验证 SHA-256。升级后的 Deployment 不会因为 prompt 切换而重启；只有检测到缺少 projected volume 的旧 Deployment 时，兼容逻辑才会滚动一次应用 Pod。
+
+每次切换后必须在 Chainlit 中新建聊天。已有 Session 保留创建时的 agent/prompt，避免一次对话混用两个 profile。ConfigMap 对 namespace 内有读取权限的用户可见，不要把密码、API key、客户数据或其他 Secret 放进 prompt。
+
+再次运行 `./kup --galileo-only` 会按 `kup.conf` 恢复目标状态。默认 `baseline + qwen` 等价于重新执行 Qwen baseline 的 custom 热加载。
+
+### 建议演示顺序
+
+1. 运行 Qwen baseline，创建新聊天并输入 `What is my credit score?`。观察 score agent/tool 返回 `550` 后 supervisor 的失败交付。
+2. 输入 `What are the cashback rewards offered by the Orbit Credit Card?`。预期 credit-card agent 通过 Pinecone 给出 grounded answer。
+3. 输入 `Recommend me a good book.`。预期不调用银行业务 agent，并回答不知道或无法回答。
+4. 在 Splunk AO 中查看 supervisor、sub-agent、tool 和 model spans，以及 Action Advancement、Action Completion、Tool Errors、Tool Selection Quality Evaluator。
+5. 执行 `./scripts/switch_prompt.sh improved`，新建聊天并重复 credit-score 请求。预期正确返回 `550`。
+6. 演示结束后执行 Qwen baseline 命令，或重新运行 `./kup --galileo-only` 恢复私有配置指定状态。
+
+## 本地运行与测试
+
+本地流程也只读取 `kup.conf`，不再使用 `.deploy.env`、`.secrets/*.env` 或 `.runtime/resolved-*.env`。
 
 ```bash
 python3.12 -m venv app/.venv
@@ -123,556 +236,75 @@ app/.venv/bin/python -m pip check
 app/.venv/bin/python -m unittest discover -s app/tests -v
 ```
 
-生产镜像使用 `app/requirements.lock`。LangGraph 0.4.x 必须搭配 `langgraph-prebuilt < 0.3` 和 `langgraph-supervisor 0.0.26`；否则会遇到 private module 或 Pregel generic API 不兼容。
-
-### 2. 模型 capability preflight
+启动本地 Chainlit：
 
 ```bash
-app/.venv/bin/python scripts/preflight_models.py
-```
-
-检查顺序固定：
-
-1. vLLM DNS/TLS。
-2. `GET /models` 中存在 `Qwen/Qwen3-14B-FP8`。
-3. 普通 Chat。
-4. 原始 OpenAI-compatible Tool Calling round-trip。
-5. LangChain `bind_tools` round-trip。
-6. 只有第 3 步成功而第 4/5 步失败，才测试百炼 fallback。
-
-结果写到 `.runtime/resolved-model.env`，不写 Secret。本次结果为：应用使用 `bailian/qwen3.7-flash`；Judge 不变。
-
-### 3. Pinecone 安全处理
-
-```bash
-app/.venv/bin/python scripts/setup_pinecone.py inventory
-app/.venv/bin/python scripts/setup_pinecone.py resolve
-app/.venv/bin/python scripts/setup_pinecone.py smoke
-```
-
-策略：
-
-- `credit-card-information` 先只读 inventory；禁止 delete、recreate、clear namespace 或盲目 upsert。
-- 本次发现它是 1536 维 BYOV index，不能在不知道原 embedding model 的情况下复用。
-- 隔离使用 `credit-card-information-qwen-demo`、`llama-text-embed-v2`、namespace `bank-docs`、文本字段 `chunk_text`。
-- records 使用稳定 ID 幂等写入；查询直接发送文本，不依赖 OpenAI Embeddings 或 OpenAI API Key。
-
-### 4. baseline smoke 与本地 Chainlit
-
-```bash
-app/.venv/bin/python scripts/local_smoke.py
 ./scripts/run_local.sh
 ```
 
-打开 `http://127.0.0.1:8000`。`local_smoke.py` 对两个底层工具做硬性验证，但 supervisor 的回答只标记为 `BASELINE OBSERVED`，不会因为故意错路由而失败，也不会自动改 prompt。
-
-## Phase 6：必须由用户完成的 Splunk AO UI checkpoint
-
-在部署前人工确认：
-
-- Project：`hangwe-Multi-Agent Banking Chatbot - Qwen Judge Demo`
-- Agent Stream：`hangwe-Default Agent Stream - Qwen Judge`
-- 以下四个 Evaluator 均存在、均选择现有 vLLM Qwen Judge Integration、均 enabled：
-  - `Action Advancement - Qwen`
-  - `Action Completion - Qwen`
-  - `Tool Errors - Qwen`
-  - `Tool Selection Quality - Qwen`
-- Demo 建议 sampling 100%。
-- Judge Playground 普通问答正常。
-
-应用 fallback 到百炼不构成修改 Judge 的理由。远程数据中心到 vLLM 延迟可能导致 evaluator timeout；若 recompute 后成功，按延迟问题记录，不修改 Integration 或 Evaluator。
-
-## Phase 7：动态发现 ACK
+执行会调用真实 model、Pinecone 和 Splunk AO 的 smoke：
 
 ```bash
-./scripts/discover_ack.sh
+app/.venv/bin/python scripts/local_smoke.py
 ```
 
-脚本每次执行都会：
-
-1. 只读检查 `ACK_BYOCNI_DIR` Git 状态。
-2. 从当前 Terraform state 读取 cluster ID/name/version。
-3. 验证 repo 私有 `kubeconfig` 中存在 `ack-byocni-demo`。
-4. 显式用该 kubeconfig/context 检查 `/readyz`、cluster-info 和所有 nodes Ready。
-5. 将本次结果写入 ignored 的 `.runtime/resolved-ack.env`。
-
-如果 Terraform state 没有 active cluster 且 `ALLOW_ACK_CREATE=0`，脚本停止。如果 kubeconfig stale 但 state 有集群，脚本使用 RAM credential 调用 ACK `GET /k8s/{ClusterId}/user_config`，保存到 `.secrets/ack-kubeconfig` 并设 0600。它绝不执行 `./kiall`。
-
-## Phase 8：构建与推送
-
-```bash
-./scripts/build_push.sh
-```
-
-脚本动态读取节点架构，当前为 `amd64`；在 Apple Silicon 上执行 `linux/amd64` build：
-
-1. Docker Hub PAT 通过 stdin 登录。
-2. buildx `--load`。
-3. 以非 root 容器启动 Chainlit 并做本地 HTTP smoke。
-4. 使用同一 build cache `--push`。
-5. 从 registry 解析 digest。
-6. 写 `.runtime/image.env`。
-7. logout 并删除临时 Docker auth 文件。
-
-标签包含 UTC timestamp 和 Git SHA；working tree 有 tracked/untracked 变更时追加 `dirty`，仓库尚无 commit 时标记 `uncommitted`。ACK 使用 digest immutable reference，不使用 `latest`。
-
-ACK 节点访问 Docker Hub 超时时，使用用户已有的 ACR 保存**同一个镜像 digest**：
-
-```bash
-./scripts/push_acr.sh
-./scripts/deploy_ack.sh
-```
-
-`push_acr.sh` 写入 `.runtime/acr-image.env`，`deploy_ack.sh` 会优先选用其中的 immutable reference。本次 ACR repository 为 `highope/multi-agent-banking`；ACK 拉取的 digest 与 Docker Hub 构建产物一致。
-
-## Phase 9–10：ACK 部署和网络验证
-
-```bash
-./scripts/deploy_ack.sh
-./scripts/validate_ack_network.sh
-```
-
-部署脚本每次先重新动态发现 ACK，再渲染模板。创建或更新：
-
-- `galileo-demo` Namespace
-- ConfigMap（仅非 Secret resolved config）
-- runtime Secret（Splunk AO、最终 application model、Pinecone）
-- 与最终镜像 registry 匹配的通用 pull Secret `registry-pull`
-- `replicas: 1`、non-root、无 service account token 的 Deployment
-- `ClusterIP` Service `80 -> 8000`
-
-网络验证从应用 Pod 内检查：
-
-- application model DNS、TLS、认证后的 `/models` 与准确 model ID；
-- Pinecone DNS 与 integrated text search；
-- Splunk AO console DNS/HTTPS。
-
-真实 Splunk AO ingestion 由随后 Web 对话产生的新 Trace 证明。
-
-本次 ACK 验收结果：Deployment `1/1 Ready`；应用镜像从乌兰察布 ACR 成功拉取；Service 保持 ClusterIP。Pod 内 application model `/models` 与精确 model ID、Pinecone integrated search、Splunk AO HTTPS 均通过。
-
-## 无需重建镜像的 Prompt 切换
-
-错误版和正确版 supervisor prompt 同时包含在同一个不可变镜像中，Fresh deployment 默认使用 `baseline`。Deployment 把 Prompt 配置作为 ConfigMap 文件挂载；切换动作只更新 ConfigMap，运行中的 Pod 不重启，也不会重新 build/push 镜像、创建虚机/节点/集群或要求本机 Docker/Colima。
-
-```bash
-# 查看 ConfigMap、运行中 Pod 和镜像 digest
-./scripts/switch_prompt.sh status
-
-# 第一阶段：当前 ACK 镜像用 custom 热加载 Qwen 适配 baseline
-./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
-
-# 第二阶段：明确列出 credit-score 能力的正确版
-./scripts/switch_prompt.sh improved
-
-# 任意候选 prompt；文件内容写入 ConfigMap，不写入镜像
-./scripts/switch_prompt.sh custom /absolute/path/to/supervisor-prompt.txt
-
-# 项目附带的生产化 routing contract 示例
-./scripts/switch_prompt.sh custom app/prompts/supervisor-production-example.txt
-```
-
-Kubernetes 的 ConfigMap 投影是最终一致的，通常几秒、最迟可能接近 kubelet 的同步周期；脚本会等待并确认运行中的应用已经解析到目标 profile。每次切换后必须新建 Chainlit 聊天；一个已经开始的聊天继续使用创建该 Session 时的 agent，避免 A/B 中途混用两个 prompt。新的 Splunk AO Session 名称包含 `[baseline]`、`[improved]` 或 `[custom]`，便于 Trace 过滤和销售演示。若脚本检测到尚未升级挂载配置的旧 Deployment，才会兼容性地滚动一次应用 Pod。
-
-这使 A/B 的镜像 digest、应用模型、Pinecone 数据、Judge Integration、四个 Evaluator 和 Kubernetes 资源配置保持一致，主要变量只有 supervisor prompt。当前不可变镜像中的官方原始 `baseline` 会被 `qwen3.7-flash` 自动补全而始终正确，因此第一阶段暂以 `[custom]` profile 热加载 `app/prompts/supervisor-baseline-qwen.txt`；它就是当前 Qwen 适配 baseline。源码内建 `baseline` 已同步为同一文本，下次正常构建镜像后即可恢复使用 `./scripts/switch_prompt.sh baseline` 和 `[baseline]` Trace 标签。
-
-早期 ACK 实测完成了 `baseline -> improved -> custom -> baseline` 热切换，Pod 名称/UID、restart count 和镜像 digest 均保持不变。随后针对 `qwen3.7-flash` 重新校准故事线时，同一热加载机制完成了 Qwen baseline 与 improved 的实测对比；当前第一阶段运行状态为 `[custom]`，内容摘要由 `switch_prompt.sh status` 核验，镜像 digest 仍为 `sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53`。
-
-## Phase 11：第一阶段 Web 交互演示（保留故意错误）
-
-### 演示前准备
-
-```bash
-./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
-./scripts/port_forward.sh
-```
-
-打开 `http://127.0.0.1:8000` 和 Splunk AO 中目标 Project/Agent Stream。当前镜像下第一阶段 Session 标签是 `[custom]`；新镜像构建后则使用 `[baseline]`。不要在正式第一阶段之前切到 `improved`。
-
-baseline 的核心缺陷仍来自官方样例：graph 中有 `credit-score-agent`，但受支持能力列表只写了 credit-card agent，也没有正确交付 score agent 返回结果的规则。官方原文在不同模型上具有不确定性；`qwen3.7-flash` 会把这个缺口自动补全，所以本项目的 Qwen 适配 baseline 明确让 score 请求只调查一次，再让未列明能力落入原有兜底。它没有改工具、Graph 或答案，只让当前模型重新显露同一种 supervisor prompt 缺陷。
-
-### Web 操作步骤
-
-1. 新建聊天，输入：
-
-   ```text
-   What is my credit score?
-   ```
-
-2. 当前 Qwen 适配 baseline 应出现下面这条最有说服力的失败路径；在 Splunk AO 中展开它：
-
-   ```text
-   Supervisor
-     -> Credit Score Agent
-     -> Credit Score Tool 返回 550
-     -> Credit Score Agent 把 550 交回 Supervisor
-     -> Supervisor 最终漏答或回答 I cannot answer that question
-   ```
-
-   官方原始 prompt 在不同模型或不同会话中还可能直接拒绝、漏答或碰巧正确返回 `550`。这种历史分布用来讲解不确定性；当前 Qwen 适配的现场主线则固定观察“工具成功、Supervisor 失败”，避免 `qwen3.7-flash` 每次自动补全缺口。
-
-3. 新建聊天，输入：
-
-   ```text
-   What are the cashback rewards offered by the Orbit Credit Card?
-   ```
-
-   预期正确执行路径是：
-
-   ```text
-   Supervisor -> Credit Card Agent -> Pinecone Retrieval
-   ```
-
-   当前 source documents 明确 Orbit Basic 没有 rewards/cashback，因此 grounded answer 应说明没有 cashback。
-
-4. 输入 out-of-scope 问题：
-
-   ```text
-   Recommend me a good book.
-   ```
-
-   预期 supervisor 不调用业务 sub-agent，回答 `I don't know` 或 `I cannot answer`。
-
-5. 在 Splunk AO 打开对应 Session/Trace，展开 supervisor、sub-agent、tool 和 model spans，观察每次执行的实际路径、耗时与错误。
-
-6. 等待四个 Evaluator；如果仅因远端 vLLM 延迟超时，点击 recompute，成功后继续。
-
-### 本次 ACK baseline 实测记录
-
-通过 `http://127.0.0.1:8000` 的 port-forward 完成了真实浏览器测试：
-
-| 独立会话 | 输入 | 实际结果 |
-|---|---|---|
-| credit score #1 | `What is my credit score?` | `Your credit score is 550.` |
-| credit score #2 | 同上 | 只说明已经转交给 credit-score agent，未返回 550；任务未完成 |
-| credit score #3 | 同上 | `I cannot answer that question.` |
-| credit score #4 | 同上 | `Your credit score is 550.` |
-| card RAG | Orbit cashback 问题 | grounded answer：Orbit Basic 没有 cashback/rewards |
-| out of scope | 推荐一本书 | `I cannot answer that question.` |
-
-针对当前 `qwen3.7-flash` 的最终 A/B 验证如下；测试直接在 ACK Pod 内运行但未挂 AO callback，避免为校准过程制造额外正式 Trace：
-
-| profile | 问题 | 完整工具路径 | Supervisor 最终结果 |
-|---|---|---|---|
-| Qwen baseline（当前 `[custom]`） | `What is my credit score?` | score handoff → `credit_score_retrieval` 返回 550 → transfer back | `I cannot answer that question` |
-| improved | 同上 | 相同路径 | `Your credit score is 550.` |
-| improved | Orbit balance-transfer APR | card handoff → Pinecone → transfer back | `0.0% for the first 12 months` |
-| improved | `Recommend me a good book.` | 无工具 | `I don't know` |
-
-这些结果不是“修复前后”对比，而是同一份故意有缺陷的 baseline 在独立会话中的真实分布：底层工具和 RAG 能工作，但 supervisor 路由与完成度不稳定。另一个经用户明确授权只读检查的官方 demo 后端中，Trace `ecc04d14-b4ce-4a51-8b7a-e187a904e557` 完整记录了 `Supervisor -> score agent -> score tool(550) -> score agent(550) -> Supervisor 拒答`。这条 Trace 证明问题不在工具，而在 supervisor 对返回结果的处理，并且前面的模型、handoff 和工具 Token 都已经消耗。请在 Splunk AO UI 中展开对应 spans 和四个 Qwen Evaluator 的 explanation；远程 Judge 超时可 recompute。
-
-### 四个 Evaluator 在演示中的关键作用
-
-| Evaluator | 本 demo 要回答的问题 | baseline 中应重点观察 | 改进后希望看到 |
-|---|---|---|---|
-| Action Advancement - Qwen | 每一步是否让用户任务向目标推进？ | handoff 和取到 550 先推进，回到 supervisor 后漏答/拒答则停止推进甚至倒退 | 正确 handoff 后持续推进到用户可见答案 |
-| Action Completion - Qwen | 最终结果是否完成用户请求？ | 即使中间已有 550，最终拒答仍意味着任务未完成 | 返回工具支持的 550，最终答复完整 |
-| Tool Errors - Qwen | 已调用工具是否发生参数、执行或返回错误？ | score tool 可以完全正常；“工具无错但最终失败”把根因缩小到 prompt/编排 | score tool 与 Pinecone 继续保持无错误 |
-| Tool Selection Quality - Qwen | 是否选择了正确的 agent/tool？ | 完整失败 Trace 中甚至可能选对 score agent/tool，因此它与 Completion 的结论并不矛盾；其他会话也可能根本没选工具 | score 问题稳定选择 score agent/tool；card 问题稳定选择 card agent/Pinecone |
-
-具体分数方向与 pass/fail 阈值以各自 rubric 和 explanation 为准。销售演示不要只读一个总分；把四项组合起来讲，才能证明 Splunk AO 在做 root-cause isolation。
-
-### 第一阶段演示话术
-
-> 这个银行助手表面上能回答问题，但多 Agent 系统真正的风险不是“模型会不会说话”，而是它能否稳定地把请求交给正确能力，并把子 Agent 的结果真正交付给客户。我们故意让 supervisor prompt 漏掉 credit-score agent。单次测试可能碰巧成功，所以传统人工点测容易给出虚假的安全感。
->
-> Splunk Agent Observability 记录的不是只有最终文字，而是 supervisor、sub-agent、模型和工具的完整执行路径。最典型的失败中，系统已经转派专家、调用工具并取得 550，花掉整条链路的时间和 Token，最后却在 supervisor 层拒答。只看聊天窗口，我们无法知道答案其实已经取回；看 Trace，浪费发生在哪里一目了然。
->
-> Prompt 最后的兜底拒绝本身并不是坏设计。银行 Agent 需要默认 deny，避免越界问题把模型诱导到未经定义的业务范围。真正的错误是 Prompt 没把“信用评分”列入合法业务能力，也没有告诉 supervisor 如何交付该子 Agent 的返回结果，于是合理的兜底错误地吞掉了合法答案。改进应该补全能力和交付规则，而不是删除安全兜底。
->
-> 四个 Evaluator 各自提供不同证据：Tool Selection Quality 看选路，Action Advancement 看每一步有没有推进，Action Completion 看客户目标是否完成，Tool Errors 用来排除工具和基础设施故障。四项组合后，我们能证明“工具选对且执行成功，但任务仍未完成”，把问题准确定位到 supervisor prompt。
-
-## Phase 12：第二阶段 Experiment 改进演示
-
-### 原则
-
-先运行 baseline Experiment，再由演示者把运行时 profile 切换为 improved；不得预先把部署版本“优化好”。A/B 两次使用同一个 Dataset、同一个应用模型、同一个 Judge Integration、同一个镜像 digest 和同四个 Evaluator，保证主要变量只有 supervisor prompt。
-
-### Dataset 准备（只通过 UI）
-
-在 Splunk AO UI 中选择或创建一个 routing-focused Dataset，然后将其准确名称填写到 `.deploy.env`：
-
-```dotenv
-SPLUNK_AO_EXPERIMENT_DATASET="实际已有 Dataset 名称"
-```
-
-建议至少包含：
-
-| input | reference output |
-|---|---|
-| `What is my credit score?` | `Your credit score is 550.` |
-| `What are the cashback rewards offered by the Orbit Credit Card?` | `The Orbit Basic Credit Card does not offer cashback rewards.` |
-| `Recommend me a good book.` | `I don't know` |
-
-不要通过本项目脚本自动 create/delete Dataset。上游 `dataset.json` / `dataset-test.json` 中部分 Orbit expected output 与当前 source documents 存在 reference drift（例如 cashback），不应通过让 Agent 编造答案来“刷过”。若要使用上游 Dataset，先在 UI 中明确标记或修正数据质量问题；routing A/B 最好排除这些干扰行。
-
-### A. 运行 baseline Experiment
-
-确认源代码仍是故意有缺陷的 prompt，然后：
+运行 Experiment：
 
 ```bash
 ./scripts/run_experiment.sh baseline
-```
-
-runner 只读取已有 Dataset，创建一次正式 Experiment，使用精确 evaluator 名称；每 10 秒有界 polling，最长约 10 分钟，不会无限等待。记录 baseline experiment 名称/链接、每行 trace、四项分数和 explanations。
-
-### B. 演示者切换到 improved
-
-`app/src/splunk_ao_langgraph_fsi_agent/prompt_profiles.py` 已将两个 profile 并列保存。`improved` 明确把 credit-score agent 列入支持能力：
-
-```text
-- a credit score agent. Use this to get the users credit score.
-```
-
-同时不再包含 Qwen baseline 中故意缺失的结果交付规则。其业务含义仍是官方 sample 的最小修复：让 Supervisor 知道信用评分请求属于哪个 Agent；不修改工具、Graph、模型或答案。演示者无需编辑源码或重建镜像，直接切换：
-
-```bash
-./scripts/switch_prompt.sh improved
-```
-
-脚本只热更新挂载的 Prompt 配置，输出的 Pod identity 和 Deployment image digest 都应与 baseline 完全相同。等待脚本确认 resolver 已切换后，重新打开一个 Chainlit 新聊天，再重复第一阶段问题。
-
-### C. 生产化的稳定路由提示（演示中的下一步建议）
-
-官方一行修复适合清晰 A/B。若客户追问如何进一步提高稳定性，可展示以下设计思想，但不要在 baseline 前应用：
-
-```text
-You are the Brahe Bank routing supervisor.
-
-Available specialists:
-- credit-card-agent: handles product, eligibility, reward, fee, APR and card-policy questions.
-- credit-score-agent: handles every request for the user's credit score and must use credit_score_retrieval.
-
-Routing policy:
-1. For any credit-score intent, always hand off to credit-score-agent before answering.
-2. For any credit-card intent, always hand off to credit-card-agent; the specialist must ground product facts in Pinecone.
-3. Do not answer an in-scope request directly and do not refuse it before the required handoff.
-4. For out-of-scope requests only, answer "I don't know".
-5. After the specialist returns, preserve tool-grounded facts and give a concise final answer.
-```
-
-稳定性来自“能力清单 + 明确 intent-to-agent mapping + must/must-not 约束 + tool grounding + regression Dataset”，不是硬编码 `550` 到 supervisor、绕过 sub-agent 或调高重试次数。`temperature=0` 已降低采样波动，但不能弥补缺失的 routing contract。
-
-### D. 运行 improved Experiment 并比较
-
-```bash
 ./scripts/run_experiment.sh improved
+./scripts/run_experiment.sh custom app/prompts/supervisor-production-example.txt
 ```
 
-在 Splunk AO Experiment UI 中并排比较 baseline 与 improved：
+Experiment 需要 `GALILEO_SPLUNK_AO_EXPERIMENT_DATASET` 指向已经由用户在 Splunk AO UI 中确认的 Dataset。脚本不会创建或修改 Project、Agent Stream、Integration、Evaluator、sampling 或 Dataset。
 
-1. 先按 `What is my credit score?` 过滤，比较 handoff/tool spans。
-2. 比较 Tool Selection Quality explanations，确认选择 score agent/tool 的一致性。
-3. 比较 Action Advancement，确认不再提前拒答或走无效步骤。
-4. 比较 Action Completion，确认最终业务目标完成。
-5. 检查 Tool Errors 没有因新路由而恶化。
-6. 重复运行或扩大 Dataset，证明不是一条 prompt 的偶然成功。
+## 安全与变更边界
 
-若 evaluator 因 vLLM 跨数据中心延迟 timeout，recompute 后恢复正常即可；报告中将其作为 Judge latency，而不是应用回归。
-
-### 第二阶段演示话术
-
-> 刚才我们没有靠猜测修改代码。Splunk AO 的 trace 告诉我们 credit-score tool 本身能工作，Tool Errors 也没有指出执行故障；真正异常集中在 supervisor 的选择和任务完成。这把排查范围从整套模型、数据库和网络，缩小到一段 routing prompt。
->
-> 现在我们把运行时 Prompt 从 Qwen baseline 切到 improved。镜像 digest、应用模型、Judge、Dataset 和四个 Evaluator 都保持不变，唯一的业务变量是 Supervisor 对 credit-score 能力及返回结果的描述。重新运行 Experiment 后，我们比较的不是两段精心挑选的聊天截图，而是同一组业务输入上的可重复结果。
->
-> 如果 Tool Selection Quality、Action Advancement 和 Action Completion 的结果及解释一起改善，同时 Tool Errors 保持健康，我们就得到了一条可审计的改进证据链：问题在哪里、改了什么、为什么有效、有没有引入新故障。这正是 Splunk AO 帮助企业把 Agent 从 demo 推向生产治理的关键价值。
-
-### 销售收束话术
-
-> 企业部署 Agent 最昂贵的不是一次错误答案，而是团队不知道错误发生在模型、编排、工具、数据还是网络。Splunk AO 把这些层放进同一条 Trace，并用持续 Evaluations 与 Experiment comparison 将故障定位和发布决策产品化。客户得到的不只是监控仪表盘，而是一套缩短调试周期、降低业务风险、支持回归门禁的 Agent 质量体系。
-
-## 在其他通用 Kubernetes 环境部署
-
-本节不依赖 ACK、Terraform、阿里云 CLI 或本项目的动态 ACK state。拥有一个可用的 Kubernetes context、`kubectl`、Python 3，以及能被集群节点拉取的应用镜像，就可以独立部署并演示。
-
-### 1. 外部依赖
-
-部署前由操作者准备：
-
-- Kubernetes 集群和一个有权限创建 Namespace、Secret、ConfigMap、Deployment、Service 的 context；
-- 可被节点访问的 OCI registry。当前发布物是 `linux/amd64`；其他节点架构应从本项目 Dockerfile 构建对应平台；
-- OpenAI-compatible application model endpoint，且必须真实支持 Tool Calling；
-- Pinecone integrated-embedding index、namespace 和文本字段；
-- 已通过 Splunk AO UI 创建的 Project、Agent Stream、Judge Integration 和四个 Evaluator。
-
-本脚本不会通过 API 创建或修改 Splunk AO 控制面对象，不会创建 Pinecone index，也不会创建 LoadBalancer、Ingress、云 registry 或虚机。应用使用远程模型时，Kubernetes 节点不需要 GPU。
-
-如果需要自行构建镜像，选择与集群节点一致的平台并推送到自己的 registry：
-
-```bash
-docker buildx build \
-  --platform linux/amd64 \
-  --push \
-  --tag registry.example.com/team/multi-agent-banking:demo .
-```
-
-生产/正式演示建议将 tag 解析为 digest，并在下面使用 `registry.example.com/team/multi-agent-banking@sha256:...`。
-
-### 2. 创建本地部署配置
-
-创建 ignored 且权限为 0600 的 `.secrets/generic-k8s.env`。不要把 Secret 放进 README、Git、镜像或普通 ConfigMap：
-
-```dotenv
-KUBECONFIG_FILE="/absolute/path/to/kubeconfig"
-KUBE_CONTEXT="your-context"
-KUBE_NAMESPACE="galileo-demo"
-
-IMAGE_REF="registry.example.com/team/multi-agent-banking@sha256:..."
-REGISTRY_SERVER="registry.example.com"
-REGISTRY_USERNAME="..."
-REGISTRY_PASSWORD="..."
-
-SPLUNK_AO_PROJECT="your-existing-project"
-SPLUNK_AO_AGENT_STREAM="your-existing-agent-stream"
-SPLUNK_AO_CONSOLE_URL="https://console.multitenant.galileocloud.io"
-SPLUNK_AO_API_KEY="..."
-
-APP_MODEL_PROVIDER="vllm"
-APP_MODEL_NAME="the-exact-model-id-returned-by-/models"
-APP_MODEL_BASE_URL="https://your-openai-compatible-endpoint/v1"
-APP_MODEL_API_KEY="..."
-MODEL_REQUEST_TIMEOUT="120"
-MODEL_MAX_RETRIES="2"
-
-PINECONE_API_KEY="..."
-PINECONE_INDEX_NAME="your-integrated-index"
-PINECONE_NAMESPACE="bank-docs"
-PINECONE_TEXT_FIELD="chunk_text"
-
-SUPERVISOR_PROMPT_PROFILE="baseline"
-SPLUNK_AO_EXPERIMENT_DATASET="ReplaceMe"
-```
-
-如果镜像确实是 public，可完全省略三个 `REGISTRY_*` 变量；部署脚本会创建空的 pull 配置。`APP_MODEL_PROVIDER` 可为 `vllm` 或 `bailian`，但 `APP_MODEL_NAME` 必须是 endpoint 实际返回的精确 ID。执行：
-
-```bash
-chmod 600 .secrets/generic-k8s.env
-./scripts/deploy_kubernetes.sh
-```
-
-也可以把配置放在其他安全路径：
-
-```bash
-GENERIC_K8S_ENV_FILE=/secure/path/banking-k8s.env \
-  ./scripts/deploy_kubernetes.sh
-```
-
-脚本只生成短生命周期的本地 Secret 文件，通过 `kubectl create secret --dry-run=client` 应用，退出时删除临时文件；所有 Kubernetes 命令使用指定 context，不切换全局 context。
-
-### 3. 验证与访问
-
-```bash
-kubectl --kubeconfig /absolute/path/to/kubeconfig \
-  --context your-context -n galileo-demo \
-  rollout status deployment/splunk-ao-banking-qwen
-
-kubectl --kubeconfig /absolute/path/to/kubeconfig \
-  --context your-context -n galileo-demo \
-  port-forward service/splunk-ao-banking-qwen 8000:80
-```
-
-打开 `http://127.0.0.1:8000`。若 Pod 无法启动，先从 Pod 内验证 application model、Pinecone 和 Splunk AO 的 DNS/TLS/egress；若私有镜像拉取失败，检查 registry host、pull Secret 和节点网络。默认 Service 仅为 ClusterIP；是否配置企业 Ingress 由该集群操作者按其安全策略决定，不是本 demo 的要求。
-
-### 4. 在通用 Kubernetes 上切换故事线
-
-同一个镜像可反复切换 prompt，不需要 Docker 或重新部署集群：
-
-```bash
-KUBECONFIG_FILE=/absolute/path/to/kubeconfig \
-KUBE_CONTEXT=your-context \
-KUBE_NAMESPACE=galileo-demo \
-  ./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
-
-KUBECONFIG_FILE=/absolute/path/to/kubeconfig \
-KUBE_CONTEXT=your-context \
-KUBE_NAMESPACE=galileo-demo \
-  ./scripts/switch_prompt.sh improved
-```
-
-当前发布镜像中，Qwen baseline 通过上述 `custom` 文件热加载，Session 标签为 `[custom]`；重新构建包含最新源码的镜像后可直接使用 `baseline`。其他自定义候选 prompt 同样使用 `custom /absolute/path/to/prompt.txt`。每次切换只更新 ConfigMap，升级后的运行 Pod 不重启；等待脚本确认应用 resolver 已读取新 profile 后新建聊天，再用四个 Evaluator 和 Experiment 比较。
-
-### 5. 通用 Kubernetes 清理
-
-先核对 context 和 namespace，再由集群操作者执行：
-
-```bash
-kubectl --kubeconfig /absolute/path/to/kubeconfig \
-  --context your-context delete namespace galileo-demo
-```
-
-这只删除该 Kubernetes namespace，不删除 registry image、Pinecone index 或 Splunk AO 对象。
-
-## Cleanup 与重复部署
-
-只清理 Galileo app 时，先重新运行 `scripts/discover_ack.sh` 确认当前私有 kubeconfig 指向 Terraform state 的当前集群，然后由操作者决定是否删除：
-
-```bash
-kubectl --kubeconfig "当前动态发现的 kubeconfig" \
-  --context ack-byocni-demo delete namespace galileo-demo
-```
-
-本任务不会自动执行该命令，也绝不执行 infra repo 的 `./kiall`。如果用户日后通过 `./kiall` 销毁 disposable ACK，新集群创建后重新执行 Phase 7–10，不复用旧 cluster ID/kubeconfig。
-
-本次任务结束后已按要求删除 Colima VM/磁盘/cache、本任务 Docker 本地镜像、Docker/buildx/Colima/Lima/QEMU 辅助组件、两个可重建 venv 和遗留临时目录；代码、lock、`.runtime` 的小型验收记录与 Secret 配置均保留。首轮清理约回收 3.7 GB；为构建 runtime-prompt replacement image 临时重装后，又完成一次最终清理（2.1 GB Colima 数据、321 MB cache、约 183 MB formula）。两组数字属于不同时间的临时环境，不应当作同时占用量累加。最终已验证上述 Colima 目录及 Colima/Docker/buildx/Lima package 均不存在。ACK、ACR、Pinecone 和 Splunk AO 未被清理或修改。
-
-之后运行本地 preflight/Experiment，先按 Phase 0 重建 `app/.venv`。只有需要重新构建镜像时才安装 Docker/buildx/Colima；仅 port-forward 或检查 ACK 不需要重新安装 Colima。
+- 所有 Kubernetes 操作都显式指定项目私有 kubeconfig 和 context。
+- `GALILEO_IMAGE_REF` 必须与 `GALILEO_REGISTRY_SERVER` 匹配，并以完整小写 `sha256` digest 结尾。
+- Pod 以 UID/GID 999 non-root 运行，禁用 service-account token、privilege escalation，并 drop 所有 Linux capabilities。
+- 运行期 Secret 不写入 manifest、日志或镜像。
+- ConfigMap 只保存非 Secret 配置与 prompt。
+- 本仓库没有 `kiall`，也不提供 namespace 删除脚本。集群销毁只能在拥有 Terraform state 的 `alicloud-ack-byocni` 中执行 `./kiall`。
+- 不要为了“清理应用”运行 ACK 项目的 `./kiall`；它会销毁该 Terraform state 拥有的完整演示环境。
 
 ## Troubleshooting
 
-### vLLM Chat 正常但没有标准 Tool Calling
+### `kup.conf` 或 kubeconfig 不存在
 
-症状：普通 Chat 200，但响应没有可解析 `tool_calls`；LangChain `bind_tools` 无法完成 round-trip。
+复制 `kup.conf.example`，填写所有 `ReplaceMe`，并把目标 ACK 的项目私有 kubeconfig 放到配置指定路径。不要合并到 `~/.kube/config`。
 
-处理：这是唯一允许 application fallback 到百炼 `qwen3.7-flash` 的情况。不要把 endpoint model ID 简写；当前准确 ID 是 `Qwen/Qwen3-14B-FP8`。Judge 保持 vLLM。
+### ACK API 不可达
 
-### Evaluator timeout
+确认 `KUBECONFIG_FILE`、`ACK_CONTEXT`、公网 API server 或本地网络/VPN。脚本不会动态扫描 Alibaba Cloud 账号，也不会从 Terraform state 重新生成 kubeconfig。
 
-症状：部分 Qwen evaluator 超时，recompute 后正常。
+### `ImagePullBackOff`
 
-原因：Splunk AO 到远程 vLLM 数据中心延迟较高。
+确认 `GALILEO_IMAGE_REF` 是 `GALILEO_REGISTRY_SERVER` 下完整 `@sha256:` reference，registry pull 用户名/密码有 repository 权限，并确认 ACK Node 能访问 registry。脚本不会回退到 `latest`。
 
-处理：recompute 并记录 Judge latency；不要改应用 provider、Evaluator 名称或 integration。只有 recompute 仍失败且 Playground 也失败时才作为 checkpoint blocker。
+### 找不到 `testcurl`
 
-### Docker Hub `ImagePullBackOff`
+这表示目标 ACK 尚未满足参考仓库的验收拓扑。先用 `alicloud-ack-byocni` 收敛 `test` workload，再重跑 `./kup --galileo-only`。不要删除这项检查来制造假成功。
 
-症状：ACK event 显示访问 `registry-1.docker.io:443` `i/o timeout`，在 manifest HEAD 阶段失败。
+### model、Pinecone 或 Splunk AO 检查失败
 
-处理：让 Kubernetes 做有限重试并保存 events。如果持续失败，停止；由用户提供现有 ACR repository，或明确授权创建 private ACR 后再同步同一 digest。不要随机换镜像、修改节点代理或创建公网 ACK Service。
+Pod 内 `pod_network_smoke.py` 要求：model HTTPS `/models` 可认证访问且包含精确 `GALILEO_APP_MODEL_NAME`；Pinecone text search 至少返回一个结果；Splunk AO console 能建立 HTTPS 连接。修复私有配置或外部服务后重跑 Galileo-only 收敛。
 
-本次处理结果：用户提供了已有 ACR 配置与 `multi-agent-banking` repository，同一 digest 推送成功；ACK 在约 24 秒内完成首次拉取并 Ready。若大文件 push 在长时间无进展后出现连接中断，优先通知操作者切换网络并暂停当前任务；不要持续轮询消耗时间与 Token。网络切换后重新执行脚本会复用已上传的 layer。
+### Prompt 切换超时
 
-### `runAsNonRoot` 无法验证镜像用户名
+运行 `./scripts/switch_prompt.sh status` 对比 ConfigMap、挂载文件、resolver 和内容 hash。Kubernetes ConfigMap 投影最终一致；切换脚本会等待最多约 180 秒，`GALILEO_PROMPT_SYNC_TIMEOUT_SEC` 则控制 `kup` 的最终复核上限。
 
-症状：镜像已成功拉取，但事件显示 image user `app` 不是数值，kubelet 无法验证其非 root 身份。
+### 配置改了但进程仍使用旧值
 
-处理：先在本地镜像中确认 `app` 实际为 UID/GID 999，再在 Pod security context 明确设置 `runAsUser: 999` 与 `runAsGroup: 999`。这只修复容器安全启动，不改变 Agent prompt 或 demo 业务行为。
+不要只 patch Secret 或 ConfigMap。运行 `./kup --galileo-only`，让共享 checksum contract 触发应用 Pod 的精确 RollingUpdate，并等待完整验收。
 
-### LangGraph import error
+## 部署记录
 
-症状：`langgraph._internal` 缺失，或 `Pregel[Any]` TypeError。
+仓库迁移、删除项、静态验证结果与未执行的 live 操作记录在 [DEPLOYMENT_REPORT.md](DEPLOYMENT_REPORT.md)。该报告描述仓库当前可复现方法，不再保存某一次临时集群 ID、Pod 名称、旧镜像 tag 或本机清理流水账。
 
-处理：使用 `app/requirements.lock`；保持 `langgraph-prebuilt 0.2.x`、`langgraph-supervisor 0.0.26` 与 LangGraph 0.4.x 组合。
+## 参考
 
-### 官方 baseline 在 `qwen3.7-flash` 上总是正确
-
-较强的工具调用模型可能从 handoff schema 自动补全官方 prompt 缺失的 credit-score 描述，使原始 baseline 始终返回 `550`。当前发布镜像用 `custom app/prompts/supervisor-baseline-qwen.txt` 恢复第一阶段：score agent/tool 正常运行并返回 550，但 Supervisor 因未列明的最终支持范围触发兜底。不要通过修改工具或硬编码 550 制造对比。
-
-### RAG 答案与 Dataset reference 不一致
-
-先检查 Pinecone 检索到的 source document，再检查 Dataset reference。不要自动让 prompt 迎合过期 reference。Splunk AO 用 Tool Errors/Tool Selection 与 completion explanation 帮助区分执行、路由和数据质量。
-
-### ACK kubeconfig stale
-
-`discover_ack.sh` 只以当前 Terraform state 为集群权威。repo kubeconfig 不可用时，通过 ACK OpenAPI取得当前 credential，写入 `.secrets/ack-kubeconfig`、chmod 0600；不合并全局 kubeconfig。
-
-## 后续完善建议
-
-1. 将 routing-focused Dataset 版本化，明确 source-doc revision，避免 reference drift。
-2. 把 baseline/improved Experiment 的最低质量门槛接入 CI，但保留 evaluator explanations 供人工复核。
-3. 为跨数据中心 Judge 增加经过容量评估的 timeout/SLO，监控 recompute 率和 Judge latency。
-4. 使用客户已有的中国区 ACR/企业镜像同步链路，避免 ACK 直连 Docker Hub；registry 仍由客户授权和治理。
-5. 增加 intent 边界、组合请求、模糊表达、tool failure、Pinecone empty-hit 和 prompt-injection 测试集。
-6. 将 Agent 版本、prompt revision、image digest、Dataset revision 写入 Experiment metadata，增强审计与回滚。
-7. 对生产 prompt 采用明确 routing contract；不要使用硬编码答案、跳过 supervisor 或隐藏失败 trace 来追求 1.0。
-8. 评估更精简的 Splunk AO instrumentation extras，减小镜像和依赖面，同时确保所需 LangChain spans 不丢失。
+- [ACK BYOCNI Cilium/Tetragon Demo](https://github.com/highopes/alicloud-ack-byocni)
+- [Splunk AO Multi-agent banking chatbot sample](https://agent-observability-docs.splunk.com/getting-started/sample-projects/multi-agent)
+- [Splunk AO Multi-agent LangGraph evaluations](https://agent-observability-docs.splunk.com/cookbooks/use-cases/multi-agent-langgraph/multi-agent-langgraph)
+- [Pinecone integrated embedding indexes](https://docs.pinecone.io/guides/indexes/create-an-index)

@@ -1,346 +1,222 @@
-# Deployment Report — Splunk AO Multi-Agent Banking Chatbot
+# Deployment and Operations Migration Report
 
 ## Summary
 
-- Date: 2026-09-13 to 2026-09-14 (Asia/Shanghai)
-- Demo state: Qwen-adapted intentionally imperfect baseline active through runtime `custom` prompt
-- Completed: Phase 0–11, runtime prompt-profile switching, generic Kubernetes deployment path, ACK rollout, Pod network validation and browser-driven live baseline
-- Current status: ACK Deployment `1/1 Ready`; ACR image pull, Chainlit, selected application model, Pinecone and Splunk AO ingestion all passed; final live Prompt reproduces score-tool success followed by Supervisor refusal
-- Phase 12: optional Experiment runner is ready; execution intentionally awaits the presenter selecting an existing Dataset in the Splunk AO UI
-- Destructive operations: none
-- Splunk AO control-plane API writes: none
-- Pinecone protected index destructive writes: none
-- Public application resources created: none
+On 2026-09-19 this repository was migrated from its original, standalone ACK deployment toolchain to the Galileo deployment and maintenance contract used by [highopes/alicloud-ack-byocni](https://github.com/highopes/alicloud-ack-byocni).
 
-## Source provenance
+The migration is repository-only. No command in this work changed the running ACK cluster, namespace, Deployment, Secret, ConfigMap, Service, image, prompt state, Terraform state, Alibaba Cloud resource, Pinecone object, or Splunk AO control-plane object.
 
-- Galileo repository HEAD at the second build: `bb87e2ceec3e75cf875417984be3de3131e34ea0`; runtime prompt-switch changes were intentionally still in the working tree.
-- Splunk AO upstream: `splunk/splunk-ao-python` commit `53b9df9c4ae01f940a55a08d446b2212f67ff94c`
-- ACK infrastructure working clone at the latest discovery: commit `c39698832067`
-- ACK infrastructure working tree at the latest discovery contained user-owned changes in `README.md`, `docs/MIGRATION.md` and `kup`; they were only reported and never modified by this task
+The result has one supported ACK application workflow:
 
-The upstream clone under `upstream/splunk-ao-python` was not modified. The `after` sample was copied into `app` before adaptation.
-
-## Local tools used during deployment
-
-| Tool | Version / platform |
-|---|---|
-| Python | 3.12.14 |
-| kubectl | 1.35.1, darwin/arm64 |
-| Terraform | 1.16.1, darwin_arm64 |
-| Alibaba Cloud CLI | 3.5.0 |
-| Docker client/server | 29.8.0 / 29.5.2 |
-| Docker buildx | 0.37.1 |
-| Local Docker server arch | arm64 |
-| ACK target arch | amd64 |
-
-Colima was installed temporarily because no Docker daemon was available. The first VM initialization reported a decompression-stage failure even though the downloaded gzip and 3.3 GiB disk image were complete; a non-destructive retry reused the verified files and started successfully. Per user instruction, the local container stack and large build artifacts were removed after final acceptance evidence was collected; the versions above record what produced the deployed artifact, not what remains installed.
-
-## Important application dependencies
-
-Exact versions are stored in `app/requirements.lock`. Key versions:
-
-| Package | Version |
-|---|---|
-| splunk-ao | 0.4.0 |
-| galileo-core | 4.5.0 |
-| chainlit | 2.5.5 |
-| langchain | 0.3.30 |
-| langchain-openai | 0.3.35 |
-| langgraph | 0.4.10 |
-| langgraph-prebuilt | 0.2.3 |
-| langgraph-supervisor | 0.0.26 |
-| pinecone | 7.3.0 |
-| openai | 2.54.0 |
-
-`pip check` passed locally and inside the linux/amd64 production image. Seven offline unit tests passed, including baseline/improved/custom prompt-profile tests. The explicit prebuilt/supervisor pins resolve incompatibilities observed with newer packages and LangGraph 0.4.x.
-
-## Model preflight
-
-### Primary vLLM
-
-- Base URL: configured HTTPS vLLM endpoint (recorded in `.deploy.env`)
-- Requested/actual model ID: `Qwen/Qwen3-14B-FP8`
-- DNS/TLS: PASS
-- `GET /models`: PASS; exact model present
-- Ordinary Chat: PASS
-- Raw OpenAI-compatible Tool Calling: FAIL capability check; response did not expose a standard parseable `tool_calls` round-trip
-- LangChain Tool Calling: primary was not accepted as a usable application tool model
-
-This is a capability failure, not a connectivity/auth/model-name failure. It satisfies the task's only permitted fallback condition because ordinary Chat passed first.
-
-### Bailian fallback
-
-- Provider/model: `bailian/qwen3.7-flash`
-- DNS/TLS: PASS
-- `GET /models`: PASS
-- Ordinary Chat: PASS
-- Raw Tool Calling round-trip: PASS
-- LangChain `bind_tools` round-trip: PASS
-
-### Resolved application model
-
-- Provider: `bailian`
-- Model: `qwen3.7-flash`
-- Reason: primary vLLM ordinary Chat passed but actual Tool Calling capability did not
-- Runtime record: `.runtime/resolved-model.env`
-
-The four Splunk AO Evaluators continue to use the existing vLLM Qwen Judge Integration. Application fallback did not modify Judge configuration.
-
-## Splunk AO
-
-- Project: `hangwe-Multi-Agent Banking Chatbot - Qwen Judge Demo`
-- Agent Stream: `hangwe-Default Agent Stream - Qwen Judge`
-- Exact evaluators:
-  - `Action Advancement - Qwen`
-  - `Action Completion - Qwen`
-  - `Tool Errors - Qwen`
-  - `Tool Selection Quality - Qwen`
-- Control-plane changes made by this task: none
-
-Phase 6 was confirmed by the user in the UI. Some evaluator runs timed out because Splunk AO calls a vLLM endpoint in a remote data center; user-confirmed recompute succeeded for all affected evaluations. This is recorded as Judge latency, not an application failure.
-
-Latest explicit local baseline observation session:
-
-- Session ID: `966e80bb-39a1-4f28-9702-1ec966aacd8e`
-- Credit-score direct tool: PASS
-- Pinecone direct retrieval: PASS
-- Credit-score supervisor route in this run: supervisor -> score agent -> score tool, answer 550
-- Credit-card supervisor route in this run: supervisor -> card agent -> Pinecone, grounded no-cashback answer
-- Out-of-scope route: no tool, `I don't know`
-
-Earlier baseline executions also exhibited missed delegation/refusal, confirming the intentional prompt omission creates unstable behavior. The successful latest run was not used to “fix” or erase the baseline defect.
-
-The user also authorized a read-only inspection of a second official-demo backend. Trace `ecc04d14-b4ce-4a51-8b7a-e187a904e557` showed the strongest version of the defect: Supervisor handed off to the score agent, `credit_score_retrieval` returned 550, the score agent returned 550 and transferred back, then the Supervisor answered `I cannot answer that question.` No Splunk AO control-plane object was modified during this inspection, and the supplied credential was neither printed nor stored.
-
-## Pinecone
-
-### Protected existing index
-
-- Name: `credit-card-information`
-- Status: Ready
-- Dimension: 1536
-- Metric: cosine
-- Integrated model metadata: none
-- Namespace: default/empty
-- Total vectors at inventory: 10
-- Treatment: preserved completely read-only; not deleted, recreated, cleared, or blindly overwritten
-
-Because this is a BYOV-style index and its original embedding model is not known, the application does not guess an embedding model and does not use OpenAI Embeddings.
-
-### Selected isolated index
-
-- Name: `credit-card-information-qwen-demo`
-- Integrated embedding: `llama-text-embed-v2`
-- Dimension: 1024
-- Metric: cosine
-- Namespace: `bank-docs`
-- Text field: `chunk_text`
-- Stable records: 10
-- Text search smoke: PASS
-- Resolution reason: isolated integrated-embedding index verified
-
-## Local functional validation
-
-- Application module import without external side effects: PASS
-- Model preflight: PASS with policy-compliant fallback
-- Pinecone inventory/resolve/search: PASS
-- Direct credit-score tool: PASS
-- Direct Pinecone retrieval: PASS
-- Chainlit bind on `127.0.0.1:8000`: PASS
-- Chainlit HTTP response: PASS
-- Splunk AO baseline Trace flush: PASS
-- Offline unit tests: 7/7 PASS in the production linux/amd64 image
-- Secret files: `.secrets` mode 0700; env files mode 0600
-
-The smoke runner records supervisor baseline outcomes without grading intentional routing failures or changing prompts.
-
-After the Qwen baseline calibration, the six dependency-free Settings/Prompt-profile tests and all shell/diff checks passed. The full seven-test local suite was not reinstalled after cleanup: its import-side-effect case requires `langgraph`, and the local venv had intentionally been removed to preserve Mac disk space. That same import test had already passed in the production image, while the updated baseline and existing improved behavior were exercised directly in the live ACK application environment.
-
-## Dynamic ACK discovery
-
-The disposable cluster changed between the two task days. The following latest values were read on 2026-09-14 from the current ACK BYOCNI Terraform state and private kubeconfig. They are an observation, not a fixed configuration:
-
-- Current cluster ID: `c5de7bc3cc3224aa6b7f7a64a79b041e8`
-- Cluster name: `ack-byocni-wlcb`
-- Kubernetes version: `1.36.2-aliyun.1`
-- Zone: `cn-wulanchabu-a`
-- Private kubeconfig source: current `alicloud-ack-byocni/kubeconfig`
-- Explicit context: `ack-byocni-demo`
-- Nodes: 3/3 Ready
-- Architecture: amd64
-
-All kubectl calls used explicit kubeconfig/context. The global kube context was not treated as authority or modified. `./kup` and `./kiall` were not executed.
-
-The previous observed cluster ID was not reused. This real cluster replacement validates the dynamic discovery requirement.
-
-## Runtime prompt-profile design
-
-The first image embedded only the faulty prompt, which would have required an image rebuild for the improved phase. The deployed replacement image contains three runtime profiles:
-
-- `baseline`: the official intentionally incomplete supervisor prompt
-- `improved`: the same prompt plus only the official credit-score capability line
-- `custom`: arbitrary operator-supplied prompt text stored in a Kubernetes ConfigMap
-
-With application model `qwen3.7-flash`, the official baseline text consistently inferred the missing score capability and returned 550, masking the intended defect. The source-tree `baseline` was therefore adapted without changing the graph, tools or fixed answers: it performs exactly one relevant score handoff, leaves score handling outside the explicitly documented final-answer scope, and then reaches the existing fallback. `app/prompts/supervisor-baseline-qwen.txt` contains the same text for hot-loading into the currently deployed older immutable image.
-
-The Deployment projects the two prompt-selection ConfigMap keys as files. `scripts/switch_prompt.sh` patches the ConfigMap and waits until the running application resolves the new value; it does not restart the upgraded Pod, rebuild/push an image, or create a VM, node or cluster. Kubernetes ConfigMap propagation is eventually consistent, so the script waits and verifies instead of assuming an immediate update. For compatibility only, it falls back to one application-Pod rollout when it detects an older Deployment without the projected-volume mount.
-
-Each new Chainlit chat reads the active profile and constructs its own supervisor, while an existing chat keeps its original agent. This prevents one conversation from changing behavior halfway through the demo. Splunk AO Session names include the profile for trace filtering.
-
-After one rollout to install the projected-volume mount, ACK hot-reload validation executed `baseline -> improved -> custom -> baseline`. The Pod remained unchanged with zero restarts and the exact same image digest throughout all prompt changes. During the later Qwen calibration, hot loading again preserved the Pod and digest. The final live state is `[custom]` containing the Qwen-adapted baseline; this temporary label is required because local Docker/Colima had already been removed and its reinstallation was not approved, so the source-tree built-in update was not falsely represented as a rebuilt image.
-
-Final no-AO-callback behavior validation inside the ACK Pod:
-
-| Runtime Prompt | Request | Tool path | Supervisor result |
-|---|---|---|---|
-| Qwen baseline (`custom`) | credit score | score handoff → score tool returns 550 → transfer back | `I cannot answer that question` |
-| improved | credit score | same successful path | `Your credit score is 550.` |
-| improved | Orbit balance-transfer APR | card handoff → Pinecone → transfer back | `0.0% for the first 12 months` |
-| improved | book recommendation | no tool | `I don't know` |
-
-`scripts/deploy_kubernetes.sh` was also executed against the current cluster through only its generic `KUBECONFIG_FILE`/`KUBE_CONTEXT` interface. It reused the namespace and resources, completed rollout, and did not call ACK/Terraform logic.
-
-## Container image
-
-- ACK deployment repository: existing ACR `highope/multi-agent-banking`
-- Tag: `20260914-032205-bb87e2ceec`
-- Platform: `linux/amd64`
-- Digest: `sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53`
-- Immutable reference: existing ACR `highope/multi-agent-banking` plus the digest above
-- Image size reported by ACK: 131,694,701 bytes
-- Non-root user: yes
-- `pip check` inside image: PASS
-- Local linux/amd64 container HTTP smoke: PASS
-- Direct ACR build/push: PASS; Docker Hub was bypassed for the replacement image
-- Registry digest resolution: PASS
-- `latest` tag pushed: no
-- Docker auth cleanup after push: PASS
-
-Build context was approximately 2 MB and excluded `.secrets`, `.runtime`, `.env`, venv, Git metadata and kubeconfig.
-
-## ACK deployment status
-
-Namespace and resources successfully applied:
-
-- Namespace: `galileo-demo`
-- ConfigMap: `splunk-ao-banking-qwen-config`
-- Runtime Secret: `splunk-ao-banking-qwen-runtime`
-- Image pull Secret: `registry-pull`
-- Deployment: `splunk-ao-banking-qwen`
-- Service: `splunk-ao-banking-qwen`, ClusterIP only
-- Public external IP: none
-
-Current status:
-
-```text
-Deployment Ready: 1/1
-Pod: Running, 0 restarts at acceptance
-Service: ClusterIP, no external IP
+```bash
+cp kup.conf.example kup.conf
+# Fill the private config and place the project-private ACK kubeconfig at ./kubeconfig.
+./kup --galileo-only
 ```
 
-The immutable ACR image was pulled successfully in approximately 24 seconds on its first ACK pull. Its digest is:
+Ongoing prompt maintenance uses the same commands as the ACK repository:
 
-```text
-sha256:794ac724be1455ee15ea5b5904d364e59c3be382c277fa5146ad66b74901ff53
+```bash
+./scripts/switch_prompt.sh status
+./scripts/switch_prompt.sh baseline
+./scripts/switch_prompt.sh custom app/prompts/supervisor-baseline-qwen.txt
+./scripts/switch_prompt.sh improved
 ```
 
-The earlier Docker Hub failure occurred before layer download and was not an authentication error. The user supplied an existing ACR configuration and explicitly required repository name `multi-agent-banking`; the same image was copied there without creating ACR infrastructure. No random mirror, node proxy or public ACK Service was created.
+## Authority and comparison baseline
 
-The first ACR upload stalled on the previous network and ended with a broken connection. After the user switched networks, the remaining transfer completed almost immediately. Future large-transfer stalls should trigger a prompt to switch network followed by a pause, not repeated polling.
+The local read-only comparison source was:
 
-The initial ACR Pod reached `CreateContainerConfigError` because Kubernetes could not prove that image user name `app` was non-root. Local inspection verified `app` is UID/GID 999; the Pod security context now explicitly sets `runAsUser: 999` and `runAsGroup: 999`. This infrastructure-only change did not alter Agent behavior.
+```text
+/Users/hangwe/Library/CloudStorage/OneDrive-Cisco/dev/ack-byocni
+branch: main
+commit: 646f74e057a2c35bdf21fb598c14d51c84327018
+```
 
-The final baseline Pod first saw a transient Splunk AO console DNS lookup failure. An immediate bounded three-host DNS check passed on its first attempt, and the complete model/Pinecone/Splunk AO validation then passed. No application or endpoint configuration was changed.
+The reference repository remained clean before and after this migration. It was not edited.
 
-## ACK network and Web acceptance
+Only the Galileo-specific portion of that repository was brought back here. Terraform, VPC, ACK Worker, Cilium, Hubble, Timescape, Tetragon, mini-boutique and `kiall` remain exclusively owned by `alicloud-ack-byocni` and were intentionally not copied.
 
-From inside the deployed application Pod:
+## Before and after
 
-- Application model DNS and authenticated HTTPS `/models`: PASS
-- Exact selected model identity `qwen3.7-flash`: PASS
-- Pinecone integrated text search: PASS
-- Splunk AO DNS/HTTPS: PASS
+| Concern | Previous repository method | Current shared method |
+|---|---|---|
+| Private configuration | `.deploy.env` plus multiple `.secrets/*.env` and `.runtime/resolved-*.env` files | one ignored `kup.conf` |
+| Variable namespace | mixed `ACK_*`, `ACR_*`, `DOCKERHUB_*`, `VLLM_*`, `BAILIAN_*` and application names | the same `GALILEO_*` contract as the ACK repository |
+| ACK selection | inspect sibling Terraform state and dynamically discover/regenerate kubeconfig | explicit project-private `kubeconfig` plus stable `ACK_CONTEXT` |
+| Deploy/update | separate ACK and generic-Kubernetes deploy scripts | `./kup --galileo-only` |
+| Kubernetes templates | four files under `deploy/k8s` plus separate Secret rendering | `ns_galileo/multi-agent-banking.yaml` plus ephemeral Secret creation |
+| Registry Secret | generic `registry-pull` selected by multiple image flows | `galileo-registry-pull`, matching the ACK repository |
+| Image policy | local build/push workflows and resolved image files | prepublished immutable `linux/amd64` `@sha256:` image only |
+| Runtime change rollout | separate generated runtime files and apply scripts | shared Pod-input checksum contract |
+| Prompt maintenance | script depended on the old ACK discovery chain | same `kup.conf` bootstrap and `baseline/improved/custom` state model |
+| Access | standalone port-forward script | explicit `kubectl --kubeconfig ... --context ... port-forward` |
+| Cluster lifecycle | application repo could inspect sibling infrastructure state | no cluster lifecycle code in this repository |
 
-Chainlit was opened through a local port-forward to the ClusterIP Service. The observed live baseline results were:
+## Shared configuration contract
 
-| Run | Result |
-|---|---|
-| Credit score independent session 1 | Correct `550` |
-| Credit score independent session 2 | Said it transferred the request, but omitted the score |
-| Credit score independent session 3 | `I cannot answer that question.` |
-| Credit score independent session 4 | Correct `550` |
-| Orbit cashback | Pinecone-grounded answer: no cashback/rewards |
-| Out of scope book request | Correctly refused |
+`kup.conf.example` contains all 27 `GALILEO_*` keys from the reference `kup.conf.example`, with identical public values and meanings. Automated comparison found no missing, extra, or different Galileo assignment.
 
-New Splunk AO sessions were created and the Pod log showed successful authenticated ingestion calls. This distribution reproduces the intended baseline defect: the business tools are healthy, while supervisor routing/completion is inconsistent. The later Qwen-adapted baseline additionally reproduced the exact `tool returns 550 -> Supervisor refusal` path without changing tools or emitting calibration traces to AO. Evaluator results remain a UI checkpoint; remote-vLLM timeout entries may be recomputed as the user previously confirmed.
+The shared variables cover:
 
-## Acceptance checklist
+- namespace, source URL and full source commit;
+- immutable image reference and registry pull credential;
+- Splunk AO key, Project, Agent Stream and console URL;
+- application model provider, model ID, endpoint, key, timeout and retry count;
+- Pinecone key, index, namespace and text field;
+- Experiment Evaluator list and optional Dataset;
+- initial prompt profile, baseline variant and prompt convergence timeout;
+- local port-forward port.
 
-| Criterion | Result |
-|---|---|
-| Intentional baseline failure semantics preserved | PASS |
-| Baseline/improved/custom switching without image rebuild | PASS on ACK; final state Qwen baseline via `custom` |
-| Same immutable digest across prompt switches | PASS |
-| Generic Kubernetes deployment script | PASS against explicit context |
-| Policy-compliant model selection | PASS |
-| Selected model Tool Calling works | PASS locally |
-| No OpenAI API dependency | PASS |
-| Existing Pinecone index protected | PASS |
-| Four existing Qwen Evaluators unchanged | PASS, user UI confirmation |
-| Evaluator recompute after latency timeout | PASS, user confirmation |
-| Dynamic ACK discovery, no fixed ID assumption | PASS |
-| ACK nodes Ready | PASS |
-| linux/amd64 image build/push/digest | PASS |
-| No Secret in image/manifests/report | PASS; exact credential-value scan and image history/env inspection passed |
-| No public application resource | PASS |
-| ACK Deployment Ready 1/1 | PASS |
-| Pod -> Bailian/Pinecone/Splunk AO network | PASS |
-| ACK Chainlit via port-forward | PASS |
-| ACK live Trace ingestion | PASS |
-| Four evaluator definitions/configuration | PASS, user UI confirmation; recompute works for latency timeouts |
-| Optional Experiment | READY; not run because Dataset remains a required presenter/UI choice |
-| Local resource cleanup | PASS; see cleanup record below |
+This repository adds only the connection values needed to use that contract without owning the cluster: `KUP_WORKDIR`, `KUBECONFIG_FILE`, `ACK_CONTEXT`, `TEST_NAMESPACE`, `RUNTIME_DIR` and `ACK_API_TIMEOUT`.
 
-## Problems and resolutions
+The private config and kubeconfig are forced to mode 0600. They, rendered files and prompt patch files are Git ignored.
 
-1. `VLLM_MODEL_NAME` initially used a friendly name not advertised by the endpoint. It was changed to the exact `Qwen/Qwen3-14B-FP8` ID and Phase 1 was rerun.
-2. vLLM Chat worked but Tool Calling did not produce standard tool calls. Policy-compliant Bailian fallback was validated and selected.
-3. Official dependency ranges allowed incompatible LangGraph prebuilt/supervisor versions. Versions were pinned and verified.
-4. Existing Pinecone index was BYOV with unknown embeddings. It was preserved and an isolated integrated index was created.
-5. During early smoke work, the intentional prompt defect was mistakenly treated as a deployment defect and briefly improved. Those semantic changes and an added corrected dataset were removed; the first-stage defect remained intentional.
-6. Official sample Dataset contains some references inconsistent with its own current source documents. This is documented as Dataset/reference drift; the Agent is not altered to fabricate stale answers.
-7. Colima first initialization failed after download, but cache/image integrity passed. Reusing the files succeeded.
-8. ACK could not reach Docker Hub. The user provided an existing ACR configuration and required repository `multi-agent-banking`; pushing and deploying the exact same digest resolved the pull failure.
-9. The first ACR transfer stalled on one network. The user switched networks and the remaining upload completed immediately; the documented operating rule is now to ask for a network switch and pause on future large-transfer stalls.
-10. ACK rejected the non-numeric Docker `USER app` while enforcing `runAsNonRoot`. The verified UID/GID 999 was added to the Pod security context, after which rollout completed.
-11. Baking a single supervisor prompt into the image made the demo story operationally expensive. The application now resolves built-in or custom profiles from a projected ConfigMap at each new chat; one script hot-switches the running Pod while preserving its UID, restart count and image digest.
-12. A transient Pod DNS lookup failed once for the Splunk AO console. Bounded retry and the full follow-up check passed, so it was recorded as transient cluster DNS rather than hidden by an Agent change.
-13. The official baseline prompt did not fail under `qwen3.7-flash`; the model inferred the score agent from tool schemas and always returned 550. A Prompt-only Qwen adaptation now makes one score handoff, receives 550, and then reaches the existing fallback because score result delivery is absent from the documented final-answer scope. The improved profile returns 550 correctly, card RAG remains grounded, and out-of-scope requests remain refused.
-14. An intermediate Qwen baseline candidate could re-handoff after transfer-back and wait indefinitely. That test was explicitly interrupted, no process remained in the Pod, and the final Prompt constrains the request to exactly one handoff.
+## Current deployment behavior
 
-## Local cleanup record
+`./kup --galileo-only` is deliberately the only supported cluster mutation entry in this repository. Running `./kup` without that flag stops with guidance instead of implying that this repository can create ACK infrastructure.
 
-After the final image inspection, unit tests, secret scan, ACK rollout check and browser test, the following exact local targets were removed:
+The command performs the following bounded reconciliation:
 
-- Colima runtime data under `/Users/hangwe/.colima`: 2.1 GB before deletion
-- Colima download cache under `/Users/hangwe/Library/Caches/colima`: 317 MB
-- application and preflight venvs: 285 MB + 82 MB
-- Homebrew Colima/Docker/buildx/Lima/QEMU stack and now-unused QEMU dependencies: approximately 912 MB by package reports
-- one known 4 KiB ACR inspection temporary directory
+1. Validates local tools, script syntax and every required Galileo setting.
+2. Rejects placeholders, a non-HTTPS model endpoint, unknown model provider, invalid prompt selection, incomplete source SHA, mutable image reference, digest/registry mismatch and multiline Secret values.
+3. Uses only the configured private kubeconfig and context to check ACK `/readyz`.
+4. Renders the same Namespace, ConfigMap, Deployment and ClusterIP Service topology as the reference repository.
+5. Creates the runtime and image-pull Secrets from 0600 temporary files and immediately removes those files.
+6. Applies the manifest and waits for the single application Pod to become Ready.
+7. Applies the configured prompt through the shared prompt-switching primitive.
+8. Verifies the exact image, Service endpoint, cross-namespace HTTP, projected prompt files, application prompt resolver, model identity, Pinecone search and Splunk AO HTTPS.
 
-The first cleanup measured approximately 3.7 GB, excluding any additional sparse-disk benefit. The runtime-prompt replacement image later required one temporary rebuild cycle; after its tests, push and ACK acceptance checks, the container stack was removed again. That final cycle removed 2.1 GB of Colima runtime data, 321 MB of download cache, and approximately 183 MB of Colima/Docker/buildx/Lima formulae. These numbers describe two separate temporary cycles and must not be added together as if they were simultaneously resident.
+It does not run Terraform, Alibaba Cloud APIs, Helm, Docker, image push, ACK discovery or cluster add-on operations.
 
-Final absence of the named Colima directories and the Colima/Docker/buildx/Lima packages was verified. Python 3.12, `kubectl` and Alibaba Cloud CLI were retained because they are small compared with the VM stack and remain useful for dynamic ACK discovery, prompt switching and later Experiment setup. No ACK namespace, ACR image, Pinecone index, source, runtime record or Secret was removed.
+## Resource contract
 
-To run a later local Experiment, recreate `app/.venv` from the documented lock/install procedure. Reinstall the container stack only if a new application image must be built.
+The rendered manifest is byte-for-byte identical to the reference repository's `ns_galileo/multi-agent-banking.yaml` at the comparison commit. It defines:
 
-## Known limitations and next steps
+- Namespace `${GALILEO_NAMESPACE}`;
+- ConfigMap `splunk-ao-banking-qwen-config`;
+- Deployment `splunk-ao-banking-qwen` with one replica;
+- image pull Secret reference `galileo-registry-pull`;
+- runtime Secret reference `splunk-ao-banking-qwen-runtime`;
+- projected prompt ConfigMap at `/etc/banking-prompt`;
+- non-root UID/GID 999, RuntimeDefault seccomp, no privilege escalation and all capabilities dropped;
+- CPU/memory requests and limits matching the ACK repository;
+- startup, readiness and liveness TCP probes;
+- ClusterIP Service `splunk-ao-banking-qwen`, port 80 to container port 8000.
 
-- The Judge endpoint crosses data-center boundaries and can need evaluator recompute.
-- The deployed immutable image still contains the pre-adaptation built-in baseline. The final live state uses `custom` to hot-load the Qwen baseline; a future normal image build will make the updated source available under the native `[baseline]` profile label.
-- Baseline failure is intentional. It must not be treated as a deployment regression or “fixed” before the presenter switches to improved.
-- Experiment Dataset name remains `ReplaceMe` until the user selects an existing Dataset through the Splunk AO UI.
-- The second image tag captured HEAD `bb87e2ceec` while the working tree contained the prompt-switch changes. Build scripts now append `-dirty` whenever tracked or untracked changes exist; this correction applies to future tags. The deployed digest is the authoritative artifact identity for this build.
+`GALILEO_POD_INPUTS_CHECKSUM` uses the same ordered runtime input set as the reference implementation. A Secret or ordinary runtime ConfigMap change therefore causes exactly one application rollout. Prompt profile/content is excluded because it is read from a projected ConfigMap and is hot-loaded for new chats.
 
-See `README.md` for the complete Web and Experiment sales demonstration, evaluator interpretation, prompt improvement procedure, talk track, troubleshooting and future hardening recommendations.
+## Prompt maintenance
+
+`scripts/render_prompt_patch.py` remains byte-for-byte identical to the reference repository. `scripts/switch_prompt.sh` contains the same operational logic and one local bootstrap safeguard: it initializes `SCRIPT_DIR` before sourcing the shared public example, so `KUP_WORKDIR="${SCRIPT_DIR}"` works under `set -u` when the prompt script is invoked directly. This does not alter the cluster contract or prompt state model.
+
+The authoritative runtime state remains the Kubernetes ConfigMap, not a local status file. Supported states are only:
+
+- `baseline`: immutable image's official baseline;
+- `improved`: immutable image's improved prompt;
+- `custom FILE`: UTF-8 custom prompt stored in the ConfigMap.
+
+Qwen baseline deliberately uses the shared `custom app/prompts/supervisor-baseline-qwen.txt` command. The script validates custom size and content hash, waits for ConfigMap projection/application resolution, and preserves the Pod unless it encounters a legacy Deployment without the projected volume.
+
+## Local application workflow
+
+Local Chainlit, smoke and Experiment helpers now use the same private `kup.conf`:
+
+- `scripts/load_galileo_config.sh` maps `GALILEO_*` values to the unprefixed environment names consumed by the application process;
+- `scripts/run_local.sh` starts Chainlit from that mapping;
+- `scripts/local_smoke.py` reads the same config directly;
+- `scripts/run_experiment.sh` uses the same model, Pinecone, Splunk AO and prompt selection.
+
+There is no second `.env` or resolved-file configuration path. Application-internal environment names remain unchanged because they are the container/runtime interface populated from the shared manifest.
+
+## Removed legacy components
+
+The migration deleted the old deployment and maintenance stack:
+
+- `.agent-context/SPLUNK_AO_ACK_QWEN_TASK.md`
+- `.deploy.env`
+- root and application `.env.example` files
+- all files under `deploy/k8s/`
+- `scripts/build_push.sh`
+- `scripts/build_push_acr.sh`
+- `scripts/push_acr.sh`
+- `scripts/deploy_ack.sh`
+- `scripts/deploy_kubernetes.sh`
+- `scripts/discover_ack.sh`
+- `scripts/port_forward.sh`
+- `scripts/validate_ack_network.sh`
+- `scripts/preflight_models.py`
+- `scripts/setup_pinecone.py`
+- `scripts/render_k8s.py`
+- `scripts/render_registry_auth.py`
+- tracked `scripts/__pycache__/*.pyc` artifacts
+
+In a follow-up cleanup authorized by the repository owner, the obsolete untracked `.secrets/` and `.runtime/` contents were deleted. They were replaced locally by an ignored, mode-0600 `kup.conf` containing only the shared Galileo configuration and an ignored, mode-0600 project kubeconfig copied from the reference repository. The copied config excludes Alibaba RAM credentials, ACK provisioning inputs, node passwords, Isovalent repository access, Cilium/Hubble/Tetragon settings and unrelated demo configuration. No rendered `runtime/` output was copied because `kup` regenerates it when reconciliation is explicitly requested.
+
+## Documentation changes
+
+`README.md` was rewritten around the shared operating model. It now documents:
+
+- the strict boundary between ACK lifecycle and Galileo application lifecycle;
+- prerequisites and private config creation;
+- the single deploy/update command;
+- exact parameter rollout behavior;
+- status, validation and port-forward commands;
+- shared prompt maintenance and demo sequence;
+- local operation through the same config;
+- Secret/image/context security rules;
+- failure modes specific to the shared workflow.
+
+Historical transient cluster IDs, Pod names, old mutable tags, machine cleanup notes and the previous multi-phase deployment diary were removed because they are not reproducible operational instructions.
+
+## Validation performed
+
+No live-cluster command was executed. Validation was intentionally limited to repository and synthetic checks.
+
+Passed:
+
+- `bash -n` for `kup`, prompt switching, config mapping, local run and Experiment scripts;
+- Python compile checks for prompt-patch rendering and local smoke code;
+- `./kup --help` confirms that only `--galileo-only` is accepted;
+- direct prompt-script bootstrap from `kup.conf.example` reaches the expected missing-local-kubeconfig error without an unbound `SCRIPT_DIR` failure;
+- all 27 `GALILEO_*` example assignments match the reference repository exactly;
+- Kubernetes manifest diff against the reference is empty;
+- prompt-patch renderer diff against the reference is empty;
+- synthetic rendering parses as four YAML resources in the expected order and confirms immutable image placement and ClusterIP service type;
+- a full synthetic `./kup --galileo-only` run with a fake `kubectl` passed preflight, Secret creation, manifest apply, rollout, Qwen prompt convergence, image/endpoint/testcurl checks, Pod smoke and final status without contacting a cluster;
+- the local config mapper successfully consumed the existing reference repository's private config without printing its Secret values and selected the expected application model, Pinecone target and Qwen custom profile;
+- stale implementation references were absent outside documentation that explicitly records their removal;
+- the reference repository worktree remained clean.
+
+Application unit tests were also attempted without installing dependencies. With `PYTHONPATH=app`, six dependency-free settings/prompt tests passed. The import-side-effect test could not run because the local application virtual environment is absent and system Python does not have `langgraph`. No dependency download or environment recreation was performed because this repository-only migration did not require network installation.
+
+Not run by design:
+
+- `./kup --galileo-only` against ACK;
+- `scripts/switch_prompt.sh` against the live ConfigMap;
+- rollout, Service, testcurl and Pod egress validation;
+- local calls to model, Pinecone or Splunk AO;
+- image build, push or pull;
+- Terraform or Alibaba Cloud operations.
+
+The running ACK system was already deployed through the reference method, and the task explicitly prohibited changing it.
+
+## Operator migration
+
+For an operator moving from the removed workflow:
+
+1. Copy `kup.conf.example` to `kup.conf`. If reusing an existing ACK-repository config that contains an absolute `KUP_WORKDIR`, change it to this repository or restore `${SCRIPT_DIR}` before running anything.
+2. Translate the final resolved values into their `GALILEO_*` equivalents; do not copy `.runtime/resolved-*.env` as a new source of truth.
+3. Set `GALILEO_IMAGE_REF` to the already-published immutable digest and pair it with the exact source commit.
+4. Copy the project-private ACK kubeconfig and verify `ACK_CONTEXT`.
+5. Confirm the reference `test/testcurl` workload exists.
+6. Run `./kup --galileo-only` once to reconcile the new Secret name, checksum annotation and shared manifest.
+7. Use only `scripts/switch_prompt.sh` for temporary prompt changes.
+
+Changing `GALILEO_NAMESPACE` creates a new installation and does not delete the old namespace. There is intentionally no automatic migration cleanup or application-specific destroy command.
+
+## Final state
+
+The repository now presents the same Galileo deployment inputs, Kubernetes resources, configuration rollout behavior, prompt state model, validation behavior and maintenance commands as `alicloud-ack-byocni`, while keeping ACK infrastructure ownership in exactly one place.
+
+The only intentional repository-level difference is scope: this project can reconcile the Galileo application but cannot create or destroy the ACK platform beneath it.

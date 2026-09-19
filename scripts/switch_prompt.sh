@@ -15,21 +15,34 @@ case "$PROFILE" in
   *) usage; exit 2 ;;
 esac
 
-if [[ -n "${KUBE_CONTEXT:-}" ]]; then
-  KUBE_NAMESPACE="${KUBE_NAMESPACE:-galileo-demo}"
-  if [[ -n "${KUBECONFIG_FILE:-}" ]]; then
-    kctl=(kubectl --kubeconfig "$KUBECONFIG_FILE" --context "$KUBE_CONTEXT")
-  else
-    kctl=(kubectl --context "$KUBE_CONTEXT")
+if [[ -z "${KUBE_CONTEXT:-}" ]]; then
+  config_file="${KUP_CONFIG:-$ROOT_DIR/kup.conf}"
+  if [[ ! -f "$config_file" ]]; then
+    echo "KUBE_CONTEXT is not set and project config does not exist: $config_file" >&2
+    echo "Create kup.conf or set KUBE_CONTEXT, KUBECONFIG_FILE, and KUBE_NAMESPACE explicitly." >&2
+    exit 2
   fi
+
+  # kup.conf.example is shared with the ACK repository, where SCRIPT_DIR is
+  # defined by kup before the file is sourced.
+  SCRIPT_DIR="${SCRIPT_DIR:-$ROOT_DIR}"
+  set -a
+  # shellcheck disable=SC1090
+  source "$config_file"
+  set +a
+
+  workdir="${KUP_WORKDIR:-$ROOT_DIR}"
+  KUBECONFIG_FILE="${KUBECONFIG_FILE:-$workdir/kubeconfig}"
+  KUBE_CONTEXT="${ACK_CONTEXT:-ack-byocni-demo}"
+  KUBE_NAMESPACE="${KUBE_NAMESPACE:-${GALILEO_NAMESPACE:-galileo-demo}}"
 else
-  "$ROOT_DIR/scripts/discover_ack.sh" >/dev/null
-  # shellcheck disable=SC1091
-  source "$ROOT_DIR/.deploy.env"
-  # shellcheck disable=SC1091
-  source "$ROOT_DIR/.runtime/resolved-ack.env"
-  KUBE_NAMESPACE="${ACK_NAMESPACE:-galileo-demo}"
-  kctl=(kubectl --kubeconfig "$ACK_KUBECONFIG" --context "$ACK_CONTEXT")
+  KUBE_NAMESPACE="${KUBE_NAMESPACE:-galileo-demo}"
+fi
+
+if [[ -n "${KUBECONFIG_FILE:-}" ]]; then
+  kctl=(kubectl --kubeconfig "$KUBECONFIG_FILE" --context "$KUBE_CONTEXT")
+else
+  kctl=(kubectl --context "$KUBE_CONTEXT")
 fi
 
 configmap_name="splunk-ao-banking-qwen-config"

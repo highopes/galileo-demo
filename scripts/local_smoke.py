@@ -30,19 +30,52 @@ def load_env_file(path: Path) -> None:
             raise SmokeStop(f"Invalid dotenv entry in {path}:{number}")
         key, raw_value = line.split("=", 1)
         parsed = shlex.split(raw_value, comments=True, posix=True)
-        os.environ.setdefault(key.strip(), parsed[0] if parsed else "")
+        os.environ[key.strip()] = parsed[0] if parsed else ""
 
 
 def configure(root: Path) -> None:
-    load_env_file(root / ".deploy.env")
-    load_env_file(root / ".secrets" / "runtime.env")
-    load_env_file(root / ".runtime" / "resolved-model.env")
-    load_env_file(root / ".runtime" / "resolved-pinecone.env")
-    key_source = os.getenv("APP_MODEL_API_KEY_SOURCE", "")
-    selected_key = os.getenv(key_source, "") if key_source else ""
-    if not selected_key:
-        raise SmokeStop("Resolved application-model key source is unavailable")
-    os.environ["APP_MODEL_API_KEY"] = selected_key
+    load_env_file(Path(os.getenv("KUP_CONFIG", root / "kup.conf")))
+    mappings = {
+        "SPLUNK_AO_API_KEY": "GALILEO_SPLUNK_AO_API_KEY",
+        "SPLUNK_AO_PROJECT": "GALILEO_SPLUNK_AO_PROJECT",
+        "SPLUNK_AO_AGENT_STREAM": "GALILEO_SPLUNK_AO_AGENT_STREAM",
+        "SPLUNK_AO_CONSOLE_URL": "GALILEO_SPLUNK_AO_CONSOLE_URL",
+        "APP_MODEL_PROVIDER": "GALILEO_APP_MODEL_PROVIDER",
+        "APP_MODEL_NAME": "GALILEO_APP_MODEL_NAME",
+        "APP_MODEL_BASE_URL": "GALILEO_APP_MODEL_BASE_URL",
+        "APP_MODEL_API_KEY": "GALILEO_APP_MODEL_API_KEY",
+        "MODEL_REQUEST_TIMEOUT": "GALILEO_MODEL_REQUEST_TIMEOUT",
+        "MODEL_MAX_RETRIES": "GALILEO_MODEL_MAX_RETRIES",
+        "PINECONE_API_KEY": "GALILEO_PINECONE_API_KEY",
+        "PINECONE_INDEX_NAME": "GALILEO_PINECONE_INDEX_NAME",
+        "PINECONE_NAMESPACE": "GALILEO_PINECONE_NAMESPACE",
+        "PINECONE_TEXT_FIELD": "GALILEO_PINECONE_TEXT_FIELD",
+        "SPLUNK_AO_EXPERIMENT_EVALUATORS": "GALILEO_SPLUNK_AO_EXPERIMENT_EVALUATORS",
+        "SPLUNK_AO_EXPERIMENT_DATASET": "GALILEO_SPLUNK_AO_EXPERIMENT_DATASET",
+    }
+    for runtime_name, config_name in mappings.items():
+        value = os.getenv(config_name, "")
+        if runtime_name != "SPLUNK_AO_EXPERIMENT_DATASET" and (
+            not value or value == "ReplaceMe"
+        ):
+            raise SmokeStop(f"Required setting is empty or still a placeholder: {config_name}")
+        os.environ[runtime_name] = value
+
+    profile = os.getenv("GALILEO_SUPERVISOR_PROMPT_PROFILE", "baseline")
+    baseline_variant = os.getenv("GALILEO_BASELINE_PROMPT_VARIANT", "qwen")
+    if profile == "baseline" and baseline_variant == "qwen":
+        os.environ["SUPERVISOR_PROMPT_PROFILE"] = "custom"
+        os.environ["SUPERVISOR_PROMPT_CUSTOM_FILE"] = str(
+            root / "app" / "prompts" / "supervisor-baseline-qwen.txt"
+        )
+    elif profile == "baseline" and baseline_variant == "official":
+        os.environ["SUPERVISOR_PROMPT_PROFILE"] = "baseline"
+        os.environ.pop("SUPERVISOR_PROMPT_CUSTOM_FILE", None)
+    elif profile == "improved":
+        os.environ["SUPERVISOR_PROMPT_PROFILE"] = "improved"
+        os.environ.pop("SUPERVISOR_PROMPT_CUSTOM_FILE", None)
+    else:
+        raise SmokeStop("Unsupported GALILEO prompt selection")
     os.environ.setdefault("OTEL_SERVICE_NAME", "splunk-ao-banking-qwen-demo-local")
 
 
